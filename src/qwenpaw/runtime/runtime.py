@@ -19,6 +19,7 @@ import logging
 import uuid
 from typing import Any, AsyncGenerator
 
+from ..exceptions import ConfigurationException
 from .builder import AgentBuilder
 from .envelope import Envelope
 from .executor import AgentExecutor
@@ -103,6 +104,7 @@ class Runtime:
                     app_services=self.app_services,
                 )
                 ctx.agent = await builder.build(ctx)
+                await self._start_modes(ctx)
 
                 # --- [phase 4] POST_AGENT_BUILD ---
                 await hooks.run(Phase.POST_AGENT_BUILD, ctx)
@@ -163,6 +165,19 @@ class Runtime:
             async for ev in envelope.cancel_envelope():
                 yield ev
             raise
+        except ConfigurationException as e:
+            ctx.error = e
+            logger.info(
+                "runtime: configuration required session=%s code=%s",
+                getattr(ctx, "session_id", ""),
+                e.error_code or "CONFIGURATION_REQUIRED",
+            )
+            async for ev in envelope.error_envelope(
+                e.message or str(e),
+                e.error_code or "CONFIGURATION_REQUIRED",
+            ):
+                yield ev
+            raise
         except BaseException as e:
             await self._try_save_on_cancel(ctx)
 
@@ -205,6 +220,18 @@ class Runtime:
             await hooks.run(Phase.FINALLY, ctx)
 
     # ----------------------------------------------------------------- helpers
+
+    async def _start_modes(self, ctx: HookContext) -> None:
+        """Prepare every registered mode for the current user turn."""
+        for mode in self.workspace.plugins.modes:
+            try:
+                await mode.on_turn_start(ctx)
+            except Exception:
+                logger.warning(
+                    "mode '%s' turn start raised",
+                    getattr(mode, "name", "?"),
+                    exc_info=True,
+                )
 
     async def _try_save_on_cancel(self, ctx: HookContext) -> None:
         """Best-effort session save on cancellation.
@@ -498,7 +525,7 @@ class Runtime:
 
             hint_msg = Msg(
                 name="system",
-                role="system",
+                role="user",
                 content=[
                     TextBlock(
                         type="text",

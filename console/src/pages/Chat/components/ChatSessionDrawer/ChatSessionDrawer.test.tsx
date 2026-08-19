@@ -1,9 +1,10 @@
-import { describe, it, expect, vi, afterEach } from "vitest";
-import { screen, waitFor } from "@testing-library/react";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { act, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderWithProviders } from "@/test/common_setup";
 import ChatSessionDrawer from "./index";
 import { useChatAnywhereSessionsState } from "@agentscope-ai/chat";
+import { useAgentStore } from "../../../../stores/agentStore";
 
 // Mock react-window's VariableSizeList to render all items directly
 // (jsdom has no layout, so the virtual list never renders rows).
@@ -36,6 +37,7 @@ const {
   mockDeleteChat,
   mockUpdateChat,
   mockGetSessionList,
+  mockListGroups,
   mockNavigate,
   mockGetEffectiveSessionId,
 } = vi.hoisted(() => ({
@@ -45,6 +47,32 @@ const {
   mockDeleteChat: vi.fn().mockResolvedValue(undefined),
   mockUpdateChat: vi.fn().mockResolvedValue(undefined),
   mockGetSessionList: vi.fn().mockResolvedValue([]),
+  mockListGroups: vi.fn().mockResolvedValue([
+    {
+      id: "default",
+      name: "Uncategorized",
+      order: 0,
+      kind: "default",
+      source: "chat",
+      pinned: false,
+    },
+    {
+      id: "cron",
+      name: "Scheduled tasks",
+      order: 1,
+      kind: "cron",
+      source: "cron",
+      pinned: false,
+    },
+    {
+      id: "subagents",
+      name: "Subagents",
+      order: 2,
+      kind: "subagents",
+      source: "subagent",
+      pinned: false,
+    },
+  ]),
   mockNavigate: vi.fn(),
   mockGetEffectiveSessionId: vi.fn((id: string) => id),
 }));
@@ -60,7 +88,15 @@ vi.mock("@agentscope-ai/chat", () => ({
 }));
 
 vi.mock("@/api/modules/chat", () => ({
-  chatApi: { deleteChat: mockDeleteChat, updateChat: mockUpdateChat },
+  chatApi: {
+    deleteChat: mockDeleteChat,
+    updateChat: mockUpdateChat,
+    listGroups: mockListGroups,
+    createGroup: vi.fn(),
+    updateGroup: vi.fn(),
+    reorderGroups: vi.fn(),
+    deleteGroup: vi.fn(),
+  },
   sessionApi: {
     listChats: vi.fn(),
     createChat: vi.fn(),
@@ -81,6 +117,9 @@ vi.mock("../../sessionApi", () => ({
     finishSessionSwitch: vi.fn(),
     lastNavigatedChatId: null,
     getEffectiveSessionId: mockGetEffectiveSessionId,
+    // Ownership epoch helpers: tests run under a single stable owner.
+    getActiveOwner: vi.fn(() => ({ agentId: "default", generation: 0 })),
+    isActiveOwner: vi.fn(() => true),
   },
 }));
 
@@ -139,7 +178,6 @@ vi.mock("../../../../components/SessionItem", () => ({
     onClick,
     onEdit,
     onDelete,
-    onPin,
     onEditSubmit,
     onEditCancel,
   }: any) => (
@@ -150,9 +188,6 @@ vi.mock("../../../../components/SessionItem", () => ({
       </button>
       <button data-testid="delete-btn" onClick={() => onDelete?.(sessionId)}>
         delete
-      </button>
-      <button data-testid="pin-btn" onClick={() => onPin?.(sessionId)}>
-        pin
       </button>
       <button data-testid="edit-submit-btn" onClick={onEditSubmit}>
         submit
@@ -208,6 +243,10 @@ function withSession(overrides: Record<string, unknown> = {}) {
 }
 
 describe("ChatSessionDrawer", () => {
+  beforeEach(() => {
+    useAgentStore.setState({ selectedAgent: "default" });
+  });
+
   afterEach(() => vi.clearAllMocks());
 
   it("renders nothing when open=false", () => {
@@ -251,11 +290,7 @@ describe("ChatSessionDrawer", () => {
     const user = userEvent.setup();
     const onClose = vi.fn();
     renderWithProviders(<ChatSessionDrawer open onClose={onClose} />);
-    await user.click(
-      document
-        .querySelector('[data-icon="SparkOperateRightLine"]')!
-        .closest("button")!,
-    );
+    await user.click(screen.getByRole("button", { name: "common.close" }));
     expect(onClose).toHaveBeenCalledOnce();
   });
 
@@ -280,6 +315,27 @@ describe("ChatSessionDrawer", () => {
     );
     await user.click(screen.getByTestId("delete-btn"));
     expect(mockDeleteChat).not.toHaveBeenCalled();
+  });
+
+  it("delete clears the message queue for both local id and backend id", async () => {
+    const { useMessageQueueStore } = await import("@/stores/messageQueueStore");
+    useMessageQueueStore.getState().enqueue("s1", { text: "local" });
+    useMessageQueueStore.getState().enqueue("uuid-1", { text: "backend" });
+    expect(useMessageQueueStore.getState().getQueue("s1")).toHaveLength(1);
+    expect(useMessageQueueStore.getState().getQueue("uuid-1")).toHaveLength(1);
+
+    withSession({ realId: "uuid-1" });
+    const user = userEvent.setup();
+    renderWithProviders(<ChatSessionDrawer {...defaultProps} />);
+    await waitFor(() =>
+      expect(screen.getByTestId("delete-btn")).toBeInTheDocument(),
+    );
+    await user.click(screen.getByTestId("delete-btn"));
+
+    await waitFor(() => {
+      expect(useMessageQueueStore.getState().getQueue("s1")).toEqual([]);
+      expect(useMessageQueueStore.getState().getQueue("uuid-1")).toEqual([]);
+    });
   });
 
   it("edit start sets editing state and edit submit calls updateChat", async () => {
@@ -308,40 +364,73 @@ describe("ChatSessionDrawer", () => {
     expect(mockUpdateChat).not.toHaveBeenCalled();
   });
 
-  it("pin toggle calls updateChat with toggled pinned state", async () => {
-    withSession({ realId: "uuid-1", pinned: false });
-    const user = userEvent.setup();
-    renderWithProviders(<ChatSessionDrawer {...defaultProps} />);
-    await waitFor(() =>
-      expect(screen.getByTestId("pin-btn")).toBeInTheDocument(),
-    );
-    await user.click(screen.getByTestId("pin-btn"));
-    expect(mockUpdateChat).toHaveBeenCalledWith("uuid-1", { pinned: true });
-  });
-
   it("on open=true triggers session list refresh", async () => {
     renderWithProviders(<ChatSessionDrawer {...defaultProps} />);
     await vi.waitFor(() => expect(mockGetSessionList).toHaveBeenCalled());
   });
 
-  it("pinned sessions sort before unpinned", async () => {
+  it("clears stale sessions and reloads when the selected agent changes", async () => {
+    let resolveAgentB!: (sessions: Array<Record<string, unknown>>) => void;
+    const agentBList = new Promise<Array<Record<string, unknown>>>(
+      (resolve) => {
+        resolveAgentB = resolve;
+      },
+    );
+
+    mockGetSessionList
+      .mockResolvedValueOnce([
+        {
+          id: "agent-a-chat",
+          name: "Agent A Chat",
+          updatedAt: new Date().toISOString(),
+        },
+      ])
+      .mockReturnValueOnce(agentBList);
+
+    renderWithProviders(<ChatSessionDrawer {...defaultProps} />);
+    await screen.findByText("Agent A Chat");
+
+    act(() => {
+      useAgentStore.setState({ selectedAgent: "agent-b" });
+    });
+
+    await waitFor(() => {
+      expect(screen.queryByText("Agent A Chat")).not.toBeInTheDocument();
+      expect(mockGetSessionList).toHaveBeenCalledTimes(2);
+    });
+
+    await act(async () => {
+      resolveAgentB([
+        {
+          id: "agent-b-chat",
+          name: "Agent B Chat",
+          updatedAt: new Date().toISOString(),
+        },
+      ]);
+      await agentBList;
+    });
+
+    expect(await screen.findByText("Agent B Chat")).toBeInTheDocument();
+  });
+
+  it("places pinned sessions at the top of their group", async () => {
     mockGetSessionList.mockResolvedValue([
       {
         id: "s1",
-        name: "Unpinned",
+        name: "Recent unpinned",
         pinned: false,
         updatedAt: new Date().toISOString(),
       },
       {
         id: "s2",
-        name: "Pinned",
+        name: "Old pinned",
         pinned: true,
-        updatedAt: new Date().toISOString(),
+        updatedAt: "2000-01-01T00:00:00.000Z",
       },
     ]);
     renderWithProviders(<ChatSessionDrawer {...defaultProps} />);
     const items = await screen.findAllByTestId("session-item");
-    expect(items[0]).toHaveTextContent("Pinned");
-    expect(items[1]).toHaveTextContent("Unpinned");
+    expect(items[0]).toHaveTextContent("Old pinned");
+    expect(items[1]).toHaveTextContent("Recent unpinned");
   });
 });

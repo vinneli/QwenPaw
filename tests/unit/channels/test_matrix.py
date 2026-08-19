@@ -3,10 +3,12 @@
 
 # pylint: disable=redefined-outer-name,unused-import
 # pylint: disable=protected-access,unused-argument
+import asyncio
 from unittest.mock import AsyncMock, MagicMock, Mock, patch
 
 import pytest
 from nio import (
+    LoginResponse,
     MatrixRoom,
     RoomMessageAudio,
     RoomMessageFile,
@@ -17,7 +19,11 @@ from nio import (
     UploadError,
     UploadResponse,
 )
-from nio.responses import WhoamiResponse
+from nio.responses import (
+    LoginError,
+    WhoamiError,
+    WhoamiResponse,
+)
 
 from qwenpaw.schemas import (
     AgentRequest,
@@ -26,6 +32,7 @@ from qwenpaw.schemas import (
     TextContent,
 )
 from qwenpaw.app.channels.matrix.channel import MatrixChannel
+from qwenpaw.app.channels.renderer import ChannelDisplayConfig
 from qwenpaw.config.config import MatrixConfig
 
 
@@ -67,6 +74,36 @@ def matrix_channel(mock_process):
         matrix_user_id="@bot:example.com",
         access_token="test_token_123",
     )
+
+
+def test_preflight_keeps_encryption_when_nio_has_backend(matrix_channel):
+    """E2EE stays enabled when matrix-nio reports a crypto backend.
+
+    Guards #6476: the preflight checks ``nio.crypto.ENCRYPTION_ENABLED``
+    (the flag ``AsyncClientConfig`` validates against) rather than
+    probing module names, so it tracks matrix-nio's version-dependent
+    backend detection.
+    """
+    matrix_channel.encryption = True
+    with patch(
+        "qwenpaw.app.channels.matrix.channel.ENCRYPTION_ENABLED",
+        True,
+    ):
+        matrix_channel._preflight_e2ee_dependencies()
+    assert matrix_channel.encryption is True
+
+
+def test_preflight_disables_encryption_when_no_nio_backend(
+    matrix_channel,
+):
+    """No matrix-nio crypto backend -> E2EE disabled with a clear error."""
+    matrix_channel.encryption = True
+    with patch(
+        "qwenpaw.app.channels.matrix.channel.ENCRYPTION_ENABLED",
+        False,
+    ):
+        matrix_channel._preflight_e2ee_dependencies()
+    assert matrix_channel.encryption is False
 
 
 @pytest.fixture
@@ -139,17 +176,96 @@ class TestMatrixChannelInit:
             dm_disabled=True,
             group_disabled=False,
             access_control_dm=True,
+            share_session_in_group=True,
             on_reply_sent=Mock(),
-            show_tool_details=False,
-            filter_tool_messages=True,
-            filter_thinking=True,
+            display_config=ChannelDisplayConfig(
+                show_tool_details=False,
+                show_thinking=False,
+                show_tool_calls=False,
+                show_tool_results=False,
+            ),
         )
 
         assert channel.dm_disabled is True
         assert channel.group_disabled is False
-        assert channel._show_tool_details is False
-        assert channel._filter_tool_messages is True
-        assert channel._filter_thinking is True
+        assert channel.share_session_in_group is True
+        assert channel._display_config.show_tool_details is False
+        assert channel._display_config.show_tool_calls is False
+        assert channel._display_config.show_tool_results is False
+        assert not channel._display_config.show_thinking
+
+
+class TestMatrixChannelBoundedState:
+    """Bounded local state must not alter normal recent-room behavior."""
+
+    def test_room_history_evicts_least_recent_room(
+        self,
+        matrix_channel,
+        monkeypatch,
+    ):
+        from qwenpaw.app.channels.matrix import channel as matrix_module
+        from qwenpaw.app.channels.matrix.channel import HistoryEntry
+
+        monkeypatch.setattr(matrix_module, "ROOM_HISTORY_MAX_ROOMS", 2)
+        for room_id in ("!one", "!two", "!three"):
+            matrix_channel._record_history(
+                room_id,
+                HistoryEntry(sender="user", body=room_id),
+            )
+
+        assert list(matrix_channel._room_histories) == ["!two", "!three"]
+
+    def test_dm_cache_prunes_expired_and_oldest_entries(
+        self,
+        matrix_channel,
+        monkeypatch,
+    ):
+        from qwenpaw.app.channels.matrix import channel as matrix_module
+
+        monkeypatch.setattr(matrix_module, "DM_ROOM_CACHE_MAX_ENTRIES", 2)
+        matrix_channel._dm_room_cache.update(
+            {
+                "!old": {"members": [], "ts": 0},
+                "!two": {"members": [], "ts": 30_001},
+                "!three": {"members": [], "ts": 30_001},
+            },
+        )
+
+        matrix_channel._prune_dm_room_cache(
+            30_001,
+        )
+
+        assert list(matrix_channel._dm_room_cache) == ["!two", "!three"]
+
+    def test_verification_state_expires_and_cancel_clears_peer(
+        self,
+        matrix_channel,
+        monkeypatch,
+    ):
+        from qwenpaw.app.channels.matrix import channel as matrix_module
+
+        monkeypatch.setattr(matrix_module, "VERIFICATION_STATE_MAX_ENTRIES", 1)
+        matrix_channel._remember_verification_peer("old", "@old", "D1")
+        matrix_channel._remember_verification_peer("new", "@new", "D2")
+        matrix_channel._clear_verification_transaction("new")
+
+        assert "old" not in matrix_channel._verification_tx_peers
+        assert "new" not in matrix_channel._verification_tx_peers
+
+    async def test_failed_done_keeps_peer_for_retry(self, matrix_channel):
+        matrix_channel._remember_verification_peer("tx", "@user:hs", "D1")
+        client = MagicMock()
+        client.to_device = AsyncMock(side_effect=RuntimeError("network down"))
+        matrix_channel._client = client
+
+        event = MagicMock()
+        event.sender = "@user:hs"
+        event.source = {"content": {"transaction_id": "tx"}}
+
+        await matrix_channel._handle_unknown_key_verification_done(event)
+
+        assert "tx" in matrix_channel._verification_tx_peers
+        assert "tx" not in matrix_channel._sent_verification_done
 
 
 class TestMatrixChannelFromConfig:
@@ -176,19 +292,50 @@ class TestMatrixChannelFromConfig:
         channel = MatrixChannel.from_config(
             process=mock_process,
             config=matrix_config,
-            show_tool_details=False,
-            filter_tool_messages=True,
-            filter_thinking=True,
+            display_config=ChannelDisplayConfig(
+                show_tool_details=False,
+                show_thinking=False,
+                show_tool_calls=False,
+                show_tool_results=False,
+            ),
         )
 
-        assert channel._show_tool_details is False
-        assert channel._filter_tool_messages is True
-        assert channel._filter_thinking is True
+        assert channel._display_config.show_tool_details is False
+        assert channel._display_config.show_tool_calls is False
+        assert channel._display_config.show_tool_results is False
+        assert not channel._display_config.show_thinking
 
     def test_from_env_raises_not_implemented(self, mock_process):
         """Test that from_env creates a channel (uses env vars)."""
         channel = MatrixChannel.from_env(process=mock_process)
         assert isinstance(channel, MatrixChannel)
+
+    def test_from_config_share_session_in_group_default(
+        self,
+        mock_process,
+        matrix_config,
+    ):
+        """Group sessions are shared by default for compatibility."""
+        channel = MatrixChannel.from_config(
+            process=mock_process,
+            config=matrix_config,
+        )
+
+        assert channel.share_session_in_group is True
+
+    def test_from_config_share_session_in_group_false(
+        self,
+        mock_process,
+        matrix_config,
+    ):
+        """Group session isolation can be enabled through config."""
+        matrix_config.share_session_in_group = False
+        channel = MatrixChannel.from_config(
+            process=mock_process,
+            config=matrix_config,
+        )
+
+        assert channel.share_session_in_group is False
 
 
 class TestMatrixChannelMXC:
@@ -304,9 +451,74 @@ class TestMatrixChannelBuildRequest:
 
         assert isinstance(request, AgentRequest)
         assert request.channel == "matrix"
-        # user_id is intentionally set to room_id for session keying
         assert request.user_id == "!room:example.com"
         assert request.session_id == "matrix:!room:example.com"
+
+    def test_build_agent_request_group_shared_by_default(
+        self,
+        matrix_channel,
+    ):
+        """Group members share the legacy room-wide session by default."""
+        payload = {
+            "sender_id": "@user:example.com",
+            "content_parts": [
+                TextContent(type=ContentType.TEXT, text="Hello bot"),
+            ],
+            "meta": {
+                "room_id": "!room:example.com",
+                "is_group": True,
+            },
+        }
+
+        request = matrix_channel.build_agent_request_from_native(payload)
+
+        assert request.user_id == "!room:example.com"
+        assert request.session_id == "matrix:!room:example.com"
+
+    def test_build_agent_request_group_isolated_when_disabled(
+        self,
+        matrix_channel,
+    ):
+        """Disabling sharing isolates group members by sender."""
+        matrix_channel.share_session_in_group = False
+        payload = {
+            "sender_id": "@user:example.com",
+            "content_parts": [
+                TextContent(type=ContentType.TEXT, text="Hello bot"),
+            ],
+            "meta": {
+                "room_id": "!room:example.com",
+                "is_group": True,
+            },
+        }
+
+        request = matrix_channel.build_agent_request_from_native(payload)
+
+        assert request.user_id == "@user:example.com"
+        assert request.session_id == "matrix:!room:example.com"
+
+    def test_build_agent_request_dm_keeps_legacy_identity(
+        self,
+        matrix_channel,
+    ):
+        """The group sharing option does not change direct messages."""
+        matrix_channel.share_session_in_group = False
+        payload = {
+            "sender_id": "@user:example.com",
+            "content_parts": [
+                TextContent(type=ContentType.TEXT, text="Hello bot"),
+            ],
+            "meta": {
+                "room_id": "!dm_room:example.com",
+                "is_dm": True,
+                "is_group": False,
+            },
+        }
+
+        request = matrix_channel.build_agent_request_from_native(payload)
+
+        assert request.user_id == "!dm_room:example.com"
+        assert request.session_id == "matrix:!dm_room:example.com"
 
     def test_build_agent_request_with_content_parts(self, matrix_channel):
         """Test building request with existing content_parts."""
@@ -359,6 +571,20 @@ class TestMatrixChannelBuildRequest:
         result = matrix_channel.get_to_handle_from_request(request)
 
         assert result == "@user:example.com"
+
+    def test_get_to_handle_from_request_fallback_to_session_id(
+        self,
+        matrix_channel,
+    ):
+        """Prefer the room encoded in a Matrix session ID."""
+        request = MagicMock(spec=AgentRequest)
+        request.session_id = "matrix:!room:example.com"
+        request.channel_meta = {}
+        request.user_id = "@user:example.com"
+
+        result = matrix_channel.get_to_handle_from_request(request)
+
+        assert result == "!room:example.com"
 
 
 @pytest.mark.asyncio
@@ -738,6 +964,213 @@ class TestMatrixChannelStartStop:
         """Test stop when channel was never started."""
         # Should not raise
         await matrix_channel.stop()
+
+
+class TestMatrixChannelLoginRetry:
+    """Test login retry behavior for transient homeserver failures.
+
+    nio retries transport-level errors (connection refused, timeouts)
+    inside _send(), but does not retry when the homeserver returns an
+    unparseable response (e.g. 502 from a reverse proxy before Synapse
+    is ready).  MatrixChannel wraps login()/whoami() with its own
+    retry loop to cover that gap (#6684).
+    """
+
+    async def test_password_login_retries_then_succeeds(
+        self,
+        matrix_channel,
+        mock_async_client,
+        monkeypatch,
+    ):
+        """Unparseable login response is retried until ready."""
+        monkeypatch.setattr(
+            "qwenpaw.app.channels.matrix.channel"
+            "._LOGIN_RETRY_INITIAL_DELAY",
+            0.0,
+        )
+        matrix_channel.access_token = ""
+        matrix_channel.password = "test_password"
+        matrix_channel._client = mock_async_client
+        matrix_channel._save_auth_state = Mock()
+        mock_async_client.login = AsyncMock(
+            side_effect=[
+                LoginError(message="unknown error"),
+                LoginResponse(
+                    user_id="@bot:example.com",
+                    device_id="DEV",
+                    access_token="tok",
+                ),
+            ],
+        )
+
+        ok = await matrix_channel._login_with_password(
+            "@bot:example.com",
+            "DEV",
+        )
+
+        assert ok is True
+        assert mock_async_client.login.call_count == 2
+
+    async def test_password_login_no_retry_on_forbidden(
+        self,
+        matrix_channel,
+        mock_async_client,
+    ):
+        """Credential errors (M_FORBIDDEN) are not retried."""
+        matrix_channel.access_token = ""
+        matrix_channel.password = "test_password"
+        matrix_channel._client = mock_async_client
+        matrix_channel._save_auth_state = Mock()
+        mock_async_client.login = AsyncMock(
+            return_value=LoginError(
+                message="Forbidden",
+                status_code="M_FORBIDDEN",
+            ),
+        )
+
+        ok = await matrix_channel._login_with_password(
+            "@bot:example.com",
+            "DEV",
+        )
+
+        assert ok is False
+        assert mock_async_client.login.call_count == 1
+
+    async def test_password_login_no_retry_on_404(
+        self,
+        matrix_channel,
+        mock_async_client,
+    ):
+        """Non-JSON 404 (wrong URL) is not retried."""
+        matrix_channel.access_token = ""
+        matrix_channel.password = "test_password"
+        matrix_channel._client = mock_async_client
+        matrix_channel._save_auth_state = Mock()
+        mock_transport = MagicMock(status=404)
+        err = LoginError(message="unknown error")
+        err.transport_response = mock_transport
+        mock_async_client.login = AsyncMock(return_value=err)
+
+        ok = await matrix_channel._login_with_password(
+            "@bot:example.com",
+            "DEV",
+        )
+
+        assert ok is False
+        assert mock_async_client.login.call_count == 1
+
+    async def test_token_login_retries_then_succeeds(
+        self,
+        matrix_channel,
+        mock_async_client,
+        monkeypatch,
+    ):
+        """Unparseable whoami response is retried until ready."""
+        monkeypatch.setattr(
+            "qwenpaw.app.channels.matrix.channel"
+            "._LOGIN_RETRY_INITIAL_DELAY",
+            0.0,
+        )
+        matrix_channel._client = mock_async_client
+        matrix_channel._save_auth_state = Mock()
+        good = WhoamiResponse(
+            user_id="@bot:example.com",
+            device_id=None,
+            is_guest=False,
+        )
+        mock_async_client.whoami = AsyncMock(
+            side_effect=[
+                WhoamiError(message="unknown error"),
+                good,
+            ],
+        )
+
+        ok = await matrix_channel._login_with_access_token()
+
+        assert ok is True
+        assert mock_async_client.whoami.call_count == 2
+
+    async def test_token_login_no_retry_on_unknown_token(
+        self,
+        matrix_channel,
+        mock_async_client,
+    ):
+        """Invalid token (M_UNKNOWN_TOKEN) is not retried."""
+        matrix_channel._client = mock_async_client
+        matrix_channel._save_auth_state = Mock()
+        mock_async_client.whoami = AsyncMock(
+            return_value=WhoamiError(
+                message="Unknown token",
+                status_code="M_UNKNOWN_TOKEN",
+            ),
+        )
+
+        ok = await matrix_channel._login_with_access_token()
+
+        assert ok is False
+        assert mock_async_client.whoami.call_count == 1
+
+    async def test_token_login_stops_during_backoff(
+        self,
+        matrix_channel,
+        mock_async_client,
+        monkeypatch,
+    ):
+        """stop() during login retry terminates the loop."""
+        monkeypatch.setattr(
+            "qwenpaw.app.channels.matrix.channel"
+            "._LOGIN_RETRY_INITIAL_DELAY",
+            100.0,
+        )
+        matrix_channel._client = mock_async_client
+        matrix_channel._save_auth_state = Mock()
+        matrix_channel._stop_event = asyncio.Event()
+        call_count = 0
+
+        def whoami_and_set_stop(*args, **kwargs):
+            nonlocal call_count
+            call_count += 1
+            if call_count == 1:
+                matrix_channel._stop_event.set()
+            return WhoamiError(message="unknown error")
+
+        mock_async_client.whoami = AsyncMock(
+            side_effect=whoami_and_set_stop,
+        )
+
+        ok = await matrix_channel._login_with_access_token()
+
+        assert ok is False
+        assert call_count == 1
+
+    async def test_login_retry_cancelled_during_sleep(
+        self,
+        matrix_channel,
+        mock_async_client,
+        monkeypatch,
+    ):
+        """CancelledError propagates through the retry loop."""
+        monkeypatch.setattr(
+            "qwenpaw.app.channels.matrix.channel"
+            "._LOGIN_RETRY_INITIAL_DELAY",
+            0.0,
+        )
+        matrix_channel._client = mock_async_client
+        matrix_channel._save_auth_state = Mock()
+        mock_async_client.whoami = AsyncMock(
+            return_value=WhoamiError(message="unknown error"),
+        )
+
+        async def raise_cancelled(_delay: float) -> None:
+            raise asyncio.CancelledError()
+
+        monkeypatch.setattr(
+            "qwenpaw.app.channels.matrix.channel.asyncio.sleep",
+            raise_cancelled,
+        )
+
+        with pytest.raises(asyncio.CancelledError):
+            await matrix_channel._login_with_access_token()
 
 
 @pytest.mark.asyncio

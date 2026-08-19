@@ -2,21 +2,148 @@
 # pylint: disable=redefined-outer-name,unused-argument,protected-access
 from __future__ import annotations
 
+import asyncio
+import copy
 from types import SimpleNamespace
 
+import pytest
 from google.genai import errors as genai_errors
+from google.genai import types as genai_types
 
+import qwenpaw.providers.gemini_provider as gemini_provider_module
 from qwenpaw.providers.gemini_provider import GeminiProvider
 
 
-def _make_provider() -> GeminiProvider:
+def _make_provider(**overrides) -> GeminiProvider:
+    config = {
+        "id": "gemini",
+        "name": "Gemini",
+        "base_url": "https://generativelanguage.googleapis.com",
+        "api_key": "gem-test",
+        "chat_model": "GeminiChatModel",
+    }
+    config.update(overrides)
     return GeminiProvider(
-        id="gemini",
-        name="Gemini",
-        base_url="https://generativelanguage.googleapis.com",
-        api_key="gem-test",
-        chat_model="GeminiChatModel",
+        **config,
     )
+
+
+def test_chat_model_configures_persistent_client_headers(monkeypatch) -> None:
+    captured: list[dict] = []
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=SimpleNamespace()),
+    )
+
+    def create_client(**kwargs):
+        captured.append(kwargs)
+        return fake_client
+
+    monkeypatch.setattr(gemini_provider_module.genai, "Client", create_client)
+
+    model = _make_provider(
+        custom_headers={"X-QwenPaw-Test": "enabled"},
+    ).get_chat_model_instance("gemini-2.5-flash")
+
+    assert model.client is fake_client
+    assert len(captured) == 1
+    assert captured[0]["http_options"].headers == {
+        "X-QwenPaw-Test": "enabled",
+    }
+
+
+async def test_summary_limit_is_adapted_without_mutating_thinking(
+    monkeypatch,
+) -> None:
+    captured: dict = {}
+
+    class FakeModels:
+        async def generate_content_stream(self, **kwargs):
+            captured.update(kwargs)
+            raise RuntimeError("provider failed")
+
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=FakeModels()),
+    )
+    monkeypatch.setattr(
+        gemini_provider_module.genai,
+        "Client",
+        lambda **kwargs: fake_client,
+    )
+    model = _make_provider().get_chat_model_instance("gemini-2.5-flash")
+
+    async def fake_format(self, messages):
+        del self, messages
+        return []
+
+    monkeypatch.setattr(type(model.formatter), "format", fake_format)
+    model.parameters.thinking_enable = True
+
+    with pytest.raises(RuntimeError, match="provider failed"):
+        await model._call_api(
+            "gemini-2.5-flash",
+            [],
+            max_tokens=256,
+            disable_thinking=True,
+        )
+
+    config = captured["config"]
+    assert config["max_output_tokens"] == 256
+    assert "max_tokens" not in config
+    assert config["thinking_config"] == {
+        "include_thoughts": False,
+        "thinking_budget": 0,
+    }
+    assert model.parameters.thinking_enable is True
+
+
+async def test_summary_thinking_override_is_concurrency_safe(
+    monkeypatch,
+) -> None:
+    started = asyncio.Event()
+    release = asyncio.Event()
+    configs: list[dict] = []
+
+    class FakeModels:
+        async def generate_content_stream(self, **kwargs):
+            configs.append(kwargs["config"])
+            if len(configs) == 1:
+                started.set()
+                await release.wait()
+            return _AsyncIter([])
+
+    fake_client = SimpleNamespace(
+        aio=SimpleNamespace(models=FakeModels()),
+    )
+    monkeypatch.setattr(
+        gemini_provider_module.genai,
+        "Client",
+        lambda **kwargs: fake_client,
+    )
+    model = _make_provider().get_chat_model_instance("gemini-2.5-flash")
+
+    async def fake_format(self, messages):
+        del self, messages
+        return []
+
+    monkeypatch.setattr(type(model.formatter), "format", fake_format)
+    model.parameters.thinking_enable = True
+
+    summary_call = asyncio.create_task(
+        model._call_api(
+            "gemini-2.5-flash",
+            [],
+            disable_thinking=True,
+        ),
+    )
+    await started.wait()
+    normal_call = await model._call_api("gemini-2.5-flash", [])
+    release.set()
+    await summary_call
+
+    assert normal_call is not None
+    assert configs[0]["thinking_config"]["include_thoughts"] is False
+    assert configs[1]["thinking_config"]["include_thoughts"] is True
+    assert model.parameters.thinking_enable is True
 
 
 class _AsyncIter:
@@ -24,6 +151,7 @@ class _AsyncIter:
 
     def __init__(self, items):
         self._items = iter(items)
+        self.closed = False
 
     def __aiter__(self):
         return self
@@ -33,6 +161,18 @@ class _AsyncIter:
             return next(self._items)
         except StopIteration as exc:
             raise StopAsyncIteration from exc
+
+    async def aclose(self):
+        self.closed = True
+
+
+class _AsyncClient:
+    def __init__(self, models):
+        self.models = models
+        self.closed = False
+
+    async def aclose(self):
+        self.closed = True
 
 
 # -- check_connection --------------------------------------------------------
@@ -105,6 +245,8 @@ async def test_fetch_models_normalizes_and_deduplicates(monkeypatch) -> None:
         SimpleNamespace(
             name="models/gemini-2.5-flash",
             display_name="Gemini 2.5 Flash",
+            input_token_limit=1_048_576,
+            output_token_limit=65_536,
         ),
         SimpleNamespace(
             name="models/gemini-2.5-flash",
@@ -130,6 +272,8 @@ async def test_fetch_models_normalizes_and_deduplicates(monkeypatch) -> None:
 
     assert [m.id for m in models] == ["gemini-2.5-flash", "gemini-2.5-pro"]
     assert [m.name for m in models] == ["Gemini 2.5 Flash", "gemini-2.5-pro"]
+    assert models[0].max_input_length_auto_detected == 1_048_576
+    assert models[0].max_tokens == 65_536
     assert not provider.models
 
 
@@ -175,15 +319,15 @@ async def test_fetch_models_generic_exception_returns_empty(
 async def test_check_model_connection_success(monkeypatch) -> None:
     provider = _make_provider()
     captured: list[dict] = []
+    stream = _AsyncIter([])
 
     class FakeModels:
         async def generate_content_stream(self, **kwargs):
             captured.append(kwargs)
-            return _AsyncIter([])
+            return stream
 
-    fake_client = SimpleNamespace(
-        aio=SimpleNamespace(models=FakeModels()),
-    )
+    async_client = _AsyncClient(FakeModels())
+    fake_client = SimpleNamespace(aio=async_client)
     monkeypatch.setattr(provider, "_client", lambda timeout=5: fake_client)
 
     ok, msg = await provider.check_model_connection(
@@ -196,6 +340,8 @@ async def test_check_model_connection_success(monkeypatch) -> None:
     assert len(captured) == 1
     assert captured[0]["model"] == "gemini-2.5-flash"
     assert captured[0]["contents"] == "ping"
+    assert stream.closed is True
+    assert async_client.closed is True
 
 
 async def test_check_model_connection_empty_model_id_returns_false() -> None:
@@ -333,6 +479,24 @@ def test_sanitize_handles_anyOf_with_null() -> None:
     assert result["properties"]["cwd"] == {"type": "string"}
 
 
+def test_sanitize_handles_anyOf_with_annotated_null() -> None:
+    from qwenpaw.providers.gemini_provider import _sanitize_schema_for_gemini
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "cwd": {
+                "anyOf": [
+                    {"type": "string"},
+                    {"type": "null", "title": "None"},
+                ],
+            },
+        },
+    }
+    result = _sanitize_schema_for_gemini(schema)
+    assert result["properties"]["cwd"] == {"type": "string"}
+
+
 def test_sanitize_nested_standalone_null() -> None:
     from qwenpaw.providers.gemini_provider import _sanitize_schema_for_gemini
 
@@ -373,6 +537,55 @@ def test_sanitize_all_null_anyOf_becomes_object() -> None:
     }
     result = _sanitize_schema_for_gemini(schema)
     assert "anyOf" not in result
+
+
+def test_format_tools_strips_schema_metadata_before_sdk_validation() -> None:
+    tools = [
+        {
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search for a query.",
+                "parameters": {
+                    "$schema": "http://json-schema.org/draft-07/schema#",
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "$schema": (
+                                "http://json-schema.org/draft-07/schema#"
+                            ),
+                            "type": "string",
+                        },
+                    },
+                    "required": ["query"],
+                },
+            },
+        },
+    ]
+    original_tools = copy.deepcopy(tools)
+
+    model = _make_provider().get_chat_model_instance("gemini-2.5-flash")
+    formatted_tools, tool_config = model._format_tools(tools, None)
+
+    config = genai_types.GenerateContentConfig(tools=formatted_tools)
+    assert tool_config is None
+    assert config.tools is not None
+    assert formatted_tools == [
+        {
+            "function_declarations": [
+                {
+                    "name": "search",
+                    "description": "Search for a query.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"query": {"type": "string"}},
+                        "required": ["query"],
+                    },
+                },
+            ],
+        },
+    ]
+    assert tools == original_tools
 
 
 # -- update_config ------------------------------------------------------------

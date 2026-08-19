@@ -7,33 +7,35 @@ addition, sandbox config compilation.
 """
 
 from __future__ import annotations
+
 import hashlib
 import logging
+import os
 from pathlib import Path
 from typing import Optional
 
+from ..constant import WORKING_DIR
+from ..sandbox import (
+    MountSpec,
+    SandboxCapability,
+    SandboxConfig,
+    detect_platform_mode,
+    probe_sandbox_support,
+)
+from ..utils.io_utils import get_sync_path_lock, run_sync_io
+from .audit import AuditLog
 from .policy import (
-    GovernancePolicy,
-    GovernanceRule,
-    GovernanceAction,
-    GovernanceDecision,
-    ToolCallSpec,
     DEFAULT_SANDBOX_DENY_PATHS,
     FILE_READ_TOOLS,
     FILE_WRITE_TOOLS,
+    GovernanceAction,
+    GovernanceDecision,
+    GovernancePolicy,
+    GovernanceRule,
+    ToolCallSpec,
+    _parse_match,
     load_governance_policy,
     save_governance_policy,
-    _parse_match,
-)
-from .audit import AuditLog
-from ..constant import WORKING_DIR
-
-from ..sandbox import (
-    SandboxCapability,
-    SandboxConfig,
-    MountSpec,
-    probe_sandbox_support,
-    detect_platform_mode,
 )
 
 logger = logging.getLogger(__name__)
@@ -81,6 +83,7 @@ class ResourceGovernor:
         self._policy_dir = (
             self._governance_dir / f"{self.workspace_dir.name}_{ws_hash}"
         )
+        self._policy_path = self._policy_dir / "policy.yaml"
         self._policy: Optional[GovernancePolicy] = None
         self._sandbox_available: bool = False
         self._sandbox_capability: Optional[SandboxCapability] = None
@@ -102,14 +105,71 @@ class ResourceGovernor:
         """Probe result from start() (SandboxCapability)."""
         return self._sandbox_capability
 
+    @staticmethod
+    def _sandbox_globally_enabled() -> bool:
+        """Read the global ``security.sandbox_enabled`` switch (config.json).
+
+        Uses the mtime-cached :func:`load_config`, so this is cheap on the
+        hot path and automatically reflects Console updates (``save_config``
+        invalidates the cache). Defaults to False (sandbox off). On a config
+        read error it returns True (fail-safe): a glitch then routes the
+        command through the sandbox instead of running it unsandboxed.
+
+        On Windows without administrator privileges, the unelevated sandbox
+        backend (WRITE_RESTRICTED token) is used automatically.  The sandbox
+        remains active — only the isolation level is reduced compared to the
+        elevated (admin) backend.
+        """
+        try:
+            from ..config import load_config
+
+            config = load_config()
+            return bool(config.security.sandbox_enabled)
+        except Exception:
+            logger.debug(
+                "ResourceGovernor: failed to read sandbox_enabled; "
+                "assuming enabled (fail-safe).",
+                exc_info=True,
+            )
+            return True
+
+    def _sandbox_usable(self) -> bool:
+        """Effective sandbox availability: platform support AND global switch.
+
+        When the operator turns the switch off, the sandbox is treated as
+        if the platform did not support it — ``SANDBOX_FALLBACK`` then
+        escalates to ASK rather than running the command unsandboxed.
+        """
+        return self._sandbox_available and self._sandbox_globally_enabled()
+
+    @property
+    def sandbox_usable(self) -> bool:
+        """Whether sandbox execution is supported and globally enabled."""
+        return self._sandbox_usable()
+
     def start(self) -> None:
         """Load policy and probe sandbox capabilities."""
-        self._policy_dir.mkdir(parents=True, exist_ok=True)
-        self._policy = load_governance_policy(
-            str(self._policy_dir),
-            str(self.workspace_dir),
-            str(self.coding_project_dir),
-        )
+        with get_sync_path_lock(self._policy_path):
+            self._policy_dir.mkdir(parents=True, exist_ok=True)
+            self._policy = load_governance_policy(
+                str(self._policy_dir),
+                str(self.workspace_dir),
+                str(self.coding_project_dir),
+            )
+
+            # Persist migrations/defaults while holding the same lock used by
+            # approval transactions in other governor instances.
+            try:
+                save_governance_policy(
+                    self._policy,
+                    str(self._policy_dir),
+                    str(self.workspace_dir),
+                    str(self.coding_project_dir),
+                )
+            except Exception:
+                logger.exception(
+                    "ResourceGovernor.start: failed to persist policy.yaml",
+                )
 
         self._sandbox_capability = probe_sandbox_support()
         self._sandbox_available = self._sandbox_capability.supported
@@ -121,29 +181,13 @@ class ResourceGovernor:
             )
 
     def stop(self) -> None:
-        """Persist policy (if modified) and close the audit log."""
-        if self._policy and self._policy.rules:
-            try:
-                save_governance_policy(
-                    self._policy,
-                    str(self._policy_dir),
-                    str(self.workspace_dir),
-                    str(self.coding_project_dir),
-                )
-            except Exception:
-                logger.exception(
-                    "ResourceGovernor.stop: failed to persist policy.yaml",
-                )
-        # Close the global AuditLog: triggers the deferred VACUUM and
-        # releases the SQLite handle. Without this, audit.db is only
-        # closed on interpreter exit (best-effort) which is fragile
-        # under supervised restarts and may leak WAL frames.
-        try:
-            self.audit_log.close()
-        except Exception:
-            logger.exception(
-                "ResourceGovernor.stop: failed to close AuditLog",
-            )
+        """Finish this governor without closing process-wide resources.
+
+        Policy mutation methods persist their transactions immediately.
+        Saving this instance's snapshot here could overwrite rules committed
+        by another request. The shared AuditLog is closed at process exit,
+        not when an individual request-scoped governor stops.
+        """
 
     # ------------------------------------------------------------------
     # Core interface 1: Policy evaluation
@@ -170,23 +214,32 @@ class ResourceGovernor:
         """
         decision = self.policy.evaluate(tc_spec)
 
-        # Early probe degradation: if sandbox is unavailable, escalate
-        # SANDBOX_FALLBACK to ASK
+        # Sandbox not usable (platform unsupported OR the global
+        # security.sandbox_enabled switch is off): a SANDBOX_FALLBACK cannot
+        # run inside a sandbox. Reaching this point means the command already
+        # cleared Phase 1 deep scan (CRITICAL → DENY), Phase 1.5 shell-danger
+        # keywords, and every builtin/user DENY/ASK rule — i.e. nothing
+        # flagged it. Rather than nag the user, run it unsandboxed (ALLOW).
+        # Only the sandbox isolation layer is dropped; Phase 0-2 protections
+        # stay fully in force. STRICT never reaches here (it returns ASK in
+        # evaluate() before producing SANDBOX_FALLBACK).
         if (
             decision.action is GovernanceAction.SANDBOX_FALLBACK
-            and not self._sandbox_available
+            and not self._sandbox_usable()
         ):
+            reason = (
+                "sandbox disabled by config"
+                if self._sandbox_available
+                else f"sandbox unavailable ({self._sandbox_capability.reason})"
+            )
             logger.info(
-                "ResourceGovernor: sandbox unavailable, escalating "
-                "SANDBOX_FALLBACK to ASK for tool '%s'",
+                "ResourceGovernor: %s, running '%s' unsandboxed (ALLOW)",
+                reason,
                 tc_spec.tool_name,
             )
             decision = GovernanceDecision(
-                action=GovernanceAction.ASK,
-                reason=(
-                    f"sandbox unavailable "
-                    f"({self._sandbox_capability.reason}), ask user"
-                ),
+                action=GovernanceAction.ALLOW,
+                reason=f"{reason}, running unsandboxed",
             )
 
         # compile sandbox config
@@ -234,6 +287,8 @@ class ResourceGovernor:
             decision = governor.assert_policy(tc_spec)
             governor.audit(tc_spec, decision)
         """
+        if self._policy is not None and self._policy.audit_level == "none":
+            return
         self.audit_log.record(
             str(self.workspace_dir),
             tc_spec,
@@ -331,9 +386,13 @@ class ResourceGovernor:
 
         Strategy:
             - WORKSPACE_DIR/* → workspace_dir (mount as a whole)
-            - /absolute/path/* → /absolute/path (take directory part)
+            - ``~`` / ``$VAR`` → expanded before anything else
+            - absolute path/* → that path (take directory part)
             - relative path → workspace_dir / relative (take directory part)
             - Pure wildcards (*, **) → skip, cannot derive a concrete path
+
+        The result is always normalised, so the same directory written two
+        ways yields one string.
         """
         p = pattern.rstrip("*").rstrip("/")
 
@@ -345,12 +404,27 @@ class ResourceGovernor:
         if "WORKSPACE_DIR" in p:
             p = p.replace("WORKSPACE_DIR", workspace_dir)
 
-        # Absolute path
-        if p.startswith("/"):
-            return p
+        # ``~/.cache/uv`` is how an operator naturally writes a tool cache
+        # in policy.yaml, and every backend already expands ``~`` for
+        # deny_paths. Leaving it literal here fell through to the relative
+        # branch below and produced ``<workspace>/~/.cache/uv`` -- a path
+        # that never exists, so the backends' existence check dropped the
+        # mount and the grant silently did nothing.
+        p = os.path.expanduser(os.path.expandvars(p))
 
-        # Relative path → resolve based on workspace
-        return str(Path(workspace_dir) / p)
+        # isabs() rather than startswith("/") so a Windows path such as
+        # ``C:\Users\...`` is not mistaken for a workspace-relative one.
+        if not os.path.isabs(p):
+            # Relative path → resolve based on workspace
+            p = str(Path(workspace_dir) / p)
+
+        # expanduser only rewrites the leading ``~``, so on Windows it
+        # returns mixed separators (``C:\Users\x/.cache/uv``).
+        # ``compile_sandbox_config`` de-duplicates mounts by path string and
+        # relies on that to let a Write rule override a Read rule for the
+        # same directory; without normalising, the two spellings become two
+        # separate MountSpecs and the write never wins.
+        return os.path.normpath(p)
 
     # ------------------------------------------------------------------
     # Core interface 4: Dynamic rule addition
@@ -364,14 +438,20 @@ class ResourceGovernor:
         Note: rules are only appended to user_rules; builtin_rules are
         immutable.
         """
-        self.policy.add_rule(rule)
-        if self._policy is not None:
-            save_governance_policy(
-                self._policy,
+        with get_sync_path_lock(self._policy_path):
+            policy = load_governance_policy(
                 str(self._policy_dir),
                 str(self.workspace_dir),
                 str(self.coding_project_dir),
             )
+            policy.add_rule(rule)
+            save_governance_policy(
+                policy,
+                str(self._policy_dir),
+                str(self.workspace_dir),
+                str(self.coding_project_dir),
+            )
+            self._policy = policy
 
     async def add_approved_rule(
         self,
@@ -411,7 +491,7 @@ class ResourceGovernor:
                 duration="session",
                 session_id=tc_spec.session_id,
             )
-            self.add_rule(rule)
+            await run_sync_io(self.add_rule, rule)
             logger.info(
                 "ResourceGovernor: added approved rule: %s",
                 rule.match,

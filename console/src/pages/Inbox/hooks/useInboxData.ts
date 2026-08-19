@@ -8,6 +8,11 @@ import {
   DEFAULT_AGENT_ID,
   getAgentDisplayName,
 } from "../../../utils/agentDisplayName";
+import {
+  INBOX_EVENT_QUERY_LIMIT,
+  PUSH_MESSAGE_SOURCES,
+  isPushMessageEvent,
+} from "../../../utils/inboxEvents";
 import type { HarvestInstance, InboxSummary, PushMessage } from "../types";
 
 const PUSH_POLLING_INTERVAL_MS = 6000;
@@ -78,6 +83,8 @@ const mapEventToPushMessage = (
       ? "wechat"
       : event.source_type === "skill_autoupdate"
       ? "skill"
+      : event.source_type === "mail"
+      ? "email"
       : "email",
   channelName:
     event.source_type === "heartbeat"
@@ -88,6 +95,8 @@ const mapEventToPushMessage = (
       ? "Cron"
       : event.source_type === "skill_autoupdate"
       ? "Auto Sync"
+      : event.source_type === "mail"
+      ? "Mail"
       : "System",
   title:
     event.source_type === "skill_autoupdate"
@@ -170,11 +179,17 @@ export const useInboxData = () => {
 
   const loadPushMessages = useCallback(async () => {
     try {
-      const res = await api.getInboxEvents({ limit: 200 });
-      const events = [...(res?.events || [])].filter((event) =>
-        ["cron", "heartbeat", "memory", "skill_autoupdate"].includes(
-          event.source_type,
-        ),
+      const res = await api.getInboxEvents({
+        limit: INBOX_EVENT_QUERY_LIMIT,
+        source_types: [...PUSH_MESSAGE_SOURCES],
+      });
+      const events = [...(res?.events || [])].filter(
+        (event) =>
+          isPushMessageEvent(event) &&
+          // Pending-approval mail events are handled in the mail access
+          // control drawer; keep them out of the push message list.
+          (event.payload as Record<string, unknown> | undefined)?.acl_status !==
+            "pending",
       );
       events.sort((a, b) => (b.created_at || 0) - (a.created_at || 0));
       const nextItems: PushMessage[] = events.map((event) =>
@@ -184,8 +199,8 @@ export const useInboxData = () => {
       setSummary((prev) => ({
         ...prev,
         pushMessages: {
-          total: nextItems.length,
-          unread: nextItems.filter((m) => !m.read).length,
+          total: res?.total ?? nextItems.length,
+          unread: res?.unread_count ?? nextItems.filter((m) => !m.read).length,
         },
       }));
     } catch (error) {
@@ -252,9 +267,8 @@ export const useInboxData = () => {
     const unreadIds = pushMessagesRef.current
       .filter((message) => !message.read)
       .map((m) => m.id);
-    if (!unreadIds.length) {
-      return 0;
-    }
+    // Always call the backend — there may be unread events hidden from the
+    // local list (e.g. ACL pending notifications filtered client-side).
     await api.markInboxRead({ all: true });
     setPushMessages((prev) =>
       prev.map((message) =>

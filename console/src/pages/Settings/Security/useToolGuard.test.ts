@@ -9,6 +9,8 @@ const hoisted = vi.hoisted(() => {
   const apiMocks = {
     getToolGuard: vi.fn(),
     getBuiltinRules: vi.fn(),
+    getSandbox: vi.fn(),
+    getDenyPathsProtection: vi.fn(),
   };
   return { apiMocks };
 });
@@ -55,6 +57,16 @@ describe("useToolGuard", () => {
     vi.clearAllMocks();
     apiMocks.getToolGuard.mockReset();
     apiMocks.getBuiltinRules.mockReset();
+    apiMocks.getSandbox.mockReset();
+    apiMocks.getDenyPathsProtection.mockReset();
+    apiMocks.getSandbox.mockResolvedValue({ enabled: true });
+    apiMocks.getDenyPathsProtection.mockResolvedValue({
+      active: false,
+      protected_paths: [],
+      failed_paths: [],
+      platform_supported: false,
+      message: null,
+    });
   });
 
   it("mounts and loads config/builtinRules, sets disabledRules/autoDenyRules/customRules, loading false", async () => {
@@ -84,6 +96,7 @@ describe("useToolGuard", () => {
     expect(result.current.disabledRules.has("d1")).toBe(true);
     expect(result.current.autoDenyRules.has("a1")).toBe(true);
     expect(result.current.shellEvasionChecks).toEqual({ check_a: true });
+    expect(result.current.sandboxEnabled).toBe(true);
     expect(result.current.error).toBeNull();
   });
 

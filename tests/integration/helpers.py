@@ -39,6 +39,11 @@ def default_http_timeout(default: float = 15.0) -> float:
     return default
 
 
+def app_startup_wait_timeout() -> float:
+    """Return the maximum wait for the integration app to become ready."""
+    return default_http_timeout(60.0)
+
+
 PLUGIN_HTTP_TIMEOUT = default_http_timeout(60.0)
 LOADER_READY_TIMEOUT = 20.0
 AGENT_SCOPED_PREFIX = "/api/agents"
@@ -67,16 +72,22 @@ def create_agent(app_server, agent_id: str) -> None:
         },
     )
     assert resp.status_code == 201, app_server.logs_tail()
+    assert wait_for_agent_startup(app_server, agent_id) == "running"
 
 
 def delete_agent_quietly(app_server, agent_id: str) -> None:
-    try:
-        app_server.api_request(
-            "DELETE",
-            f"/api/agents/{agent_id}",
-        )
-    except Exception:
-        pass
+    deadline = time.time() + 30.0
+    while time.time() < deadline:
+        try:
+            response = app_server.api_request(
+                "DELETE",
+                f"/api/agents/{agent_id}",
+            )
+            if response.status_code != 409:
+                return
+        except Exception:
+            return
+        time.sleep(0.1)
 
 
 def toggle_agent(app_server, agent_id: str, enabled: bool):
@@ -85,6 +96,34 @@ def toggle_agent(app_server, agent_id: str, enabled: bool):
         "PATCH",
         f"/api/agents/{agent_id}/toggle",
         json={"enabled": enabled},
+    )
+
+
+def wait_for_agent_startup(
+    app_server,
+    agent_id: str,
+    *,
+    timeout: float = 30.0,
+) -> str:
+    """Wait for an agent to leave the pending and starting states."""
+    deadline = time.time() + timeout
+    last_status = "missing"
+    while time.time() < deadline:
+        response = app_server.api_request("GET", "/api/agents")
+        if response.status_code == 200:
+            agents = response.json().get("agents", [])
+            agent = next(
+                (item for item in agents if item.get("id") == agent_id),
+                None,
+            )
+            if agent is not None:
+                last_status = agent.get("startup_status", "missing")
+                if last_status not in {"pending", "starting"}:
+                    return last_status
+        time.sleep(0.1)
+    raise AssertionError(
+        f"Agent '{agent_id}' did not finish startup; "
+        f"last status: {last_status}",
     )
 
 
@@ -422,6 +461,17 @@ class MockLLMHandler(BaseHTTPRequestHandler):
         has_tool_result = any(m.get("role") == "tool" for m in messages)
         force_tc = getattr(self.server, "force_tool_call", False)
 
+        # Optional gate: only force the tool call when this marker is in
+        # a user message.  Needed for tools that start a *new* agent
+        # conversation (spawn_subagent): without a gate the subagent's
+        # own turn would be forced to call the same tool and recurse.
+        marker = getattr(self.server, "force_tool_call_user_marker", None)
+        if force_tc and marker:
+            force_tc = any(
+                m.get("role") == "user" and marker in str(m.get("content", ""))
+                for m in messages
+            )
+
         if force_tc and tools and not has_tool_result:
             self._stream_tool_call()
         elif has_tool_result:
@@ -436,7 +486,8 @@ class MockLLMHandler(BaseHTTPRequestHandler):
             )
             self._stream_text(text)
         else:
-            self._stream_text(MOCK_LLM_RESPONSE)
+            override = getattr(self.server, "response_text", None)
+            self._stream_text(override or MOCK_LLM_RESPONSE)
 
     def _respond_error(self, status_code: int = 422):
         self.send_response(status_code)
@@ -645,6 +696,7 @@ def register_mock_provider(app_server, mock_url: str) -> str:
         json={
             "api_key": "test-key-mock",
             "base_url": mock_url,
+            "auto_discover": False,
         },
         timeout=_HTTP_TIMEOUT,
     )

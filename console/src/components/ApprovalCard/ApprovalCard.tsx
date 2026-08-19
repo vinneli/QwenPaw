@@ -1,6 +1,6 @@
 import { useState, useEffect, useCallback, useMemo } from "react";
-import { Button, Card, Tag, Typography, Space } from "antd";
-import { Shield, Check, X, Clock, Copy, Info } from "lucide-react";
+import { Button, Card, Tag, Typography, Space, Tooltip } from "antd";
+import { Shield, Check, X, Clock, Copy, Info, AlertCircle } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useAgentStore } from "../../stores/agentStore";
 import { getAgentDisplayName } from "../../utils/agentDisplayName";
@@ -21,6 +21,8 @@ export interface ApprovalCardProps {
   agentId: string;
   ownerAgentId?: string;
   showInboxAgentContext?: boolean;
+  // One-line rationale the agent emitted before requesting this tool call.
+  reasoning?: string;
   sessionId?: string;
   rootSessionId?: string;
   // Approval-scope choice (console-only). When true the card renders
@@ -47,6 +49,7 @@ export function ApprovalCard({
   agentId,
   ownerAgentId,
   showInboxAgentContext = false,
+  reasoning,
   sessionId,
   rootSessionId,
   isGeneralized,
@@ -58,6 +61,7 @@ export function ApprovalCard({
   onAcknowledge,
 }: ApprovalCardProps) {
   const { t } = useTranslation();
+  const isAlwaysAllowDisabled = toolSource === "STRICT mode";
   const agents = useAgentStore((state) => state.agents);
   const agentsById = useMemo(
     () => new Map(agents.map((agent) => [agent.id, agent])),
@@ -96,6 +100,7 @@ export function ApprovalCard({
   }, [agentsById, ownerAgentId, agentId, t]);
   const shouldShowExecutionAgent =
     showInboxAgentContext && Boolean(isCrossSession);
+  const hasOwnerAgentIdentity = Boolean(ownerAgentId || agentId);
   const displayToolSource =
     toolSource && toolSource !== "builtin"
       ? toolSource
@@ -205,6 +210,15 @@ export function ApprovalCard({
               </div>
             ) : null}
           </>
+        ) : hasOwnerAgentIdentity ? (
+          <div className={styles.infoRow}>
+            <Text className={styles.label}>
+              {t("approval.agent", "Agent")}:
+            </Text>
+            <Tag color="success" className={styles.ownerAgentTag}>
+              {ownerAgentDisplayName}
+            </Tag>
+          </div>
         ) : null}
 
         <div className={styles.infoRow}>
@@ -242,6 +256,17 @@ export function ApprovalCard({
           <Text className={styles.value}>{findingsCount}</Text>
         </div>
 
+        {reasoning ? (
+          <div className={styles.reasoningRow}>
+            <Text className={styles.label}>
+              {t("approval.reason", "Reason")}:
+            </Text>
+            <Text
+              className={styles.reasoningText}
+            >{`\u201C${reasoning}\u201D`}</Text>
+          </div>
+        ) : null}
+
         {isCrossSession && !showInboxAgentContext && (
           <div className={styles.infoRow}>
             <Text className={styles.label}>
@@ -270,6 +295,19 @@ export function ApprovalCard({
                   {t("approval.approvePattern", "Always Allow")}:
                 </Text>
                 <code className={styles.scopeCode}>{similarTarget}</code>
+                {isAlwaysAllowDisabled && (
+                  <Tooltip
+                    title={t(
+                      "approval.alwaysAllowDisabledHint",
+                      "Always allow is unavailable for this approval source",
+                    )}
+                  >
+                    <AlertCircle
+                      size={14}
+                      className={styles.strictModeHintIcon}
+                    />
+                  </Tooltip>
+                )}
               </div>
             </div>
           </div>
@@ -353,6 +391,8 @@ export function ApprovalCard({
             {isGeneralized ? (
               <>
                 <Button
+                  type="primary"
+                  icon={<Check size={14} />}
                   onClick={() => handleApprove("exact")}
                   loading={loading === "approve-exact"}
                   disabled={loading !== null}
@@ -360,16 +400,25 @@ export function ApprovalCard({
                 >
                   {t("approval.approveExact", "Just Once")}
                 </Button>
-                <Button
-                  type="primary"
-                  icon={<Check size={14} />}
-                  onClick={() => handleApprove("similar")}
-                  loading={loading === "approve-pattern"}
-                  disabled={loading !== null}
-                  className={styles.approveAlwaysButton}
+                <Tooltip
+                  title={
+                    isAlwaysAllowDisabled
+                      ? t(
+                          "approval.alwaysAllowDisabledHint",
+                          "Always allow is unavailable for this approval source",
+                        )
+                      : undefined
+                  }
                 >
-                  {t("approval.approvePattern", "Always Allow")}
-                </Button>
+                  <Button
+                    onClick={() => handleApprove("similar")}
+                    loading={loading === "approve-pattern"}
+                    disabled={isAlwaysAllowDisabled || loading !== null}
+                    className={styles.approveAlwaysButton}
+                  >
+                    {t("approval.approvePattern", "Always Allow")}
+                  </Button>
+                </Tooltip>
               </>
             ) : (
               <Button
@@ -380,7 +429,7 @@ export function ApprovalCard({
                   loading === "approve-exact" || loading === "approve-pattern"
                 }
                 disabled={loading !== null}
-                className={styles.approveAlwaysButton}
+                className={styles.approveOnceButton}
               >
                 {t("approval.approve", "Approve")}
               </Button>

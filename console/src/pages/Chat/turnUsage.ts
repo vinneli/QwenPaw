@@ -3,10 +3,14 @@ import type {
   IAgentScopeRuntimeWebUIRef,
   IAgentScopeRuntimeWebUIMessage,
 } from "@agentscope-ai/chat";
+import { useTurnUsageStore } from "./turnUsageStore";
+import type { TurnUsageToken } from "./turnUsageStore";
 
 export const TURN_USAGE_META_KEY = "qwenpaw_turn_usage";
 
 export interface TurnUsage {
+  provider_id?: string;
+  model_name?: string;
   prompt_tokens?: number;
   completion_tokens?: number;
   total_tokens?: number;
@@ -113,6 +117,20 @@ function getResponseCardData(
   return card?.data ?? null;
 }
 
+/** Latest turn usage snapshot from assistant response cards (newest first). */
+export function extractLatestSnapshotFromCards(
+  messages: IAgentScopeRuntimeWebUIMessage[],
+): TurnUsageSnapshot | null {
+  const assistants = messages.filter((m) => m.role === "assistant");
+  for (let i = assistants.length - 1; i >= 0; i--) {
+    const data = getResponseCardData(assistants[i].cards);
+    if (!data) continue;
+    const snap = readTurnUsageFromResponseCardData(data);
+    if (snap) return snap;
+  }
+  return null;
+}
+
 function findPatchTargetAssistant(
   messages: IAgentScopeRuntimeWebUIMessage[],
 ): IAgentScopeRuntimeWebUIMessage | undefined {
@@ -182,11 +200,17 @@ const PATCH_MAX_ATTEMPTS = 40;
 export function schedulePatchLastResponseCardUsage(
   chatRef: React.RefObject<IAgentScopeRuntimeWebUIRef | null>,
   snapshot: TurnUsageSnapshot,
+  turn?: TurnUsageToken,
 ): void {
-  const tryPatch = () => patchLastResponseCardUsage(chatRef, snapshot);
+  const isCurrentTurn = () =>
+    !turn || useTurnUsageStore.getState().isTurnActive(turn);
+  const tryPatch = () =>
+    isCurrentTurn() && patchLastResponseCardUsage(chatRef, snapshot);
+  if (!isCurrentTurn()) return;
   if (tryPatch()) return;
   let attempt = 0;
   const retry = () => {
+    if (!isCurrentTurn()) return;
     if (tryPatch() || attempt >= PATCH_MAX_ATTEMPTS) return;
     attempt += 1;
     window.setTimeout(retry, PATCH_RETRY_MS);
@@ -224,15 +248,41 @@ export function patchContextMaxInputLength(
     ) as IAgentScopeRuntimeWebUIMessage;
     const updatedData = getResponseCardData(updatedMsg.cards);
     if (!updatedData) return;
-    updatedData.context_usage = {
+    const updatedContext: ContextUsage = {
       estimated_tokens: estimatedTokens,
       max_input_length: newMaxInputLength,
       context_usage_ratio: newRatio,
     };
+    updatedData.context_usage = updatedContext;
     ReactDOM.flushSync(() => {
       messagesApi.updateMessage(updatedMsg);
     });
+    useTurnUsageStore.getState().setSnapshot({
+      usage: snap.usage,
+      context_usage: updatedContext,
+    });
     return;
+  }
+
+  const storeSnap = useTurnUsageStore.getState().snapshot;
+  if (
+    storeSnap?.context_usage &&
+    readNumber(storeSnap.context_usage, "max_input_length") !==
+      newMaxInputLength
+  ) {
+    const estimatedTokens = readNumber(
+      storeSnap.context_usage,
+      "estimated_tokens",
+    );
+    const newRatio = Math.min((estimatedTokens / newMaxInputLength) * 100, 100);
+    useTurnUsageStore.getState().setSnapshot({
+      usage: storeSnap.usage,
+      context_usage: {
+        estimated_tokens: estimatedTokens,
+        max_input_length: newMaxInputLength,
+        context_usage_ratio: newRatio,
+      },
+    });
   }
 }
 
@@ -257,6 +307,9 @@ function parseSseDataLines(buffer: string): {
 }
 
 function snapshotFromSsePayload(raw: string): TurnUsageSnapshot | null {
+  // Fast path: skip the (second) JSON.parse for the vast majority of SSE
+  // events — only `type: "turn_usage"` payloads are relevant here.
+  if (!raw.includes("turn_usage")) return null;
   try {
     return parseTurnUsageSsePayload(JSON.parse(raw) as Record<string, unknown>);
   } catch {
@@ -274,6 +327,7 @@ function snapshotFromSsePayload(raw: string): TurnUsageSnapshot | null {
 export function wrapChatResponseUsageStream(
   response: Response,
   chatRef: React.RefObject<IAgentScopeRuntimeWebUIRef | null>,
+  turn?: TurnUsageToken,
 ): Response {
   if (!response.body) return response;
 
@@ -301,7 +355,17 @@ export function wrapChatResponseUsageStream(
           if (snap) pendingUsage = snap;
         }
         if (pendingUsage) {
-          schedulePatchLastResponseCardUsage(chatRef, pendingUsage);
+          let accepted = true;
+          if (turn) {
+            accepted = useTurnUsageStore
+              .getState()
+              .setSnapshotForTurn(pendingUsage, turn);
+          } else {
+            useTurnUsageStore.getState().setSnapshot(pendingUsage);
+          }
+          if (accepted) {
+            schedulePatchLastResponseCardUsage(chatRef, pendingUsage, turn);
+          }
         }
       },
     }),

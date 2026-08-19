@@ -8,10 +8,14 @@ import {
   Tooltip,
   Badge,
   Popover,
+  Tour,
 } from "antd";
-import { useState, useEffect, useMemo, useCallback } from "react";
+import type { TourProps } from "antd";
+import { useState, useEffect, useMemo, useCallback, useRef } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { useTranslation } from "react-i18next";
+import { ChevronDown, MessageSquareText } from "lucide-react";
+import { AnimatePresence, motion, useReducedMotion } from "motion/react";
 import { useAppMessage } from "../hooks/useAppMessage";
 import AgentSelector from "../components/AgentSelector";
 import {
@@ -32,10 +36,11 @@ import {
   syncSessionsGlobal,
   type ExtendedSession,
 } from "../stores/sessionListStore";
-import { useCodingMode } from "../stores/codingModeStore";
 import { useSidebarModeStore } from "../stores/sidebarModeStore";
-import { buildSessionPath, getSessionIdFromPath } from "../utils/sessionRoute";
+import { buildChatPath, getSessionIdFromPath } from "../utils/sessionRoute";
+import { useAgentStore } from "../stores/agentStore";
 import sessionApi from "../pages/Chat/sessionApi";
+import { useInboxWobble } from "../hooks/useInboxWobble";
 import styles from "./index.module.less";
 import { useTheme } from "../contexts/ThemeContext";
 import { useMenuItems, useRoutes } from "../plugins/registry/hooks";
@@ -49,8 +54,13 @@ import {
   toAntdItems,
 } from "./registry/adapter";
 import type { FlatMenuEntry } from "./registry/adapter";
+import { filterMenuForAgentCapabilities } from "./registry/capabilities";
 import type { MenuItem } from "../plugins/registry/types";
 import type { ReactNode } from "react";
+import {
+  dismissDesktopModeHint,
+  shouldShowDesktopModeHint,
+} from "../utils/desktopModeHint";
 
 // ── Layout ────────────────────────────────────────────────────────────────
 
@@ -70,7 +80,9 @@ const INBOX_BADGE_POLLING_MS = 6000;
 
 /** Menu item IDs that remain visible in simple sidebar mode (no groups). */
 const SIMPLE_MODE_WHITELIST = new Set([
+  "core.files",
   "core.inbox",
+  "core.app-center",
   "core.cron-jobs",
   "core.agent-config",
   "core.models",
@@ -113,14 +125,8 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
   const { t } = useTranslation();
   const { message } = useAppMessage();
   const { isDark } = useTheme();
-  // When coding mode is on, the sidebar "Chat" entry should land on /coding
-  // (FileTree + Editor + Chat panel) rather than the bare Chat page.
-  const { codingMode } = useCodingMode();
   const currentSessionId = getSessionIdFromPath(location.pathname);
-  const chatPath = buildSessionPath(
-    codingMode ? "coding" : "chat",
-    currentSessionId,
-  );
+  const chatPath = buildChatPath(currentSessionId);
   const [authEnabled, setAuthEnabled] = useState(false);
   const [accountModalOpen, setAccountModalOpen] = useState(false);
   const [accountLoading, setAccountLoading] = useState(false);
@@ -129,11 +135,36 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
   // the main content on narrow viewports.
   const [collapsed, setCollapsed] = useState(isMobileSidebarViewport);
   const [settingsOpen, setSettingsOpen] = useState(false);
+  const settingsButtonRef = useRef<HTMLButtonElement>(null);
+  const [desktopModeHintOpen, setDesktopModeHintOpen] = useState(false);
   const [isMobile, setIsMobile] = useState(isMobileSidebarViewport);
-  const [hasInboxUnread, setHasInboxUnread] = useState(false);
+  const [simpleAgentFunctionsExpanded, setSimpleAgentFunctionsExpanded] =
+    useState(false);
+  const prefersReducedMotion = useReducedMotion();
+  const [hasUnreadMessages, setHasUnreadMessages] = useState(false);
+  const [hasPendingApprovals, setHasPendingApprovals] = useState(false);
+  const [shakeInbox, setShakeInbox] = useState(false);
+  const [wobbleEnabled] = useInboxWobble();
+  const currentApprovalIdsRef = useRef<Set<string>>(new Set());
+  const seenApprovalIdsRef = useRef<Set<string>>(new Set());
 
   // Sidebar mode: "simple" (only core items) or "full" (everything)
   const { mode: sidebarMode } = useSidebarModeStore();
+  const { selectedAgent, agents } = useAgentStore();
+  const currentAgent = agents.find((agent) => agent.id === selectedAgent);
+  const backendCapabilities = useMemo(
+    () =>
+      currentAgent
+        ? {
+            ...currentAgent.backend_capabilities,
+            workspace_ui:
+              currentAgent.backend === "qwenpaw"
+                ? currentAgent.backend_capabilities?.workspace_ui ?? true
+                : false,
+          }
+        : undefined,
+    [currentAgent],
+  );
 
   // Menu + route snapshots from registry (builtin + plugin registrations merged).
   const rawAgentMenu = useMenuItems("primary.agentScoped");
@@ -141,13 +172,15 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
   const routes = useRoutes();
 
   // Apply simple-mode filtering when enabled
-  const agentMenu = useMemo(
-    () =>
-      sidebarMode === "simple"
-        ? flattenMenuForSimpleMode(rawAgentMenu)
-        : rawAgentMenu,
-    [rawAgentMenu, sidebarMode],
-  );
+  const agentMenu = useMemo(() => {
+    const visibleMenu = filterMenuForAgentCapabilities(
+      rawAgentMenu,
+      backendCapabilities,
+    );
+    return sidebarMode === "simple"
+      ? flattenMenuForSimpleMode(visibleMenu)
+      : visibleMenu;
+  }, [backendCapabilities, rawAgentMenu, sidebarMode]);
   const settingsMenu = useMemo(
     () =>
       sidebarMode === "simple"
@@ -164,6 +197,12 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
       ...flattenMenu(settingsMenu, routes, 16),
     ];
   }, [agentMenu, settingsMenu, routes, sidebarMode]);
+  const simpleInboxEntry = simpleFlatNav.find(
+    (entry) => entry.key === "core.inbox",
+  );
+  const simpleFoldedNav = simpleFlatNav.filter(
+    (entry) => entry.key !== "core.inbox",
+  );
 
   // ── Effects ──────────────────────────────────────────────────────────────
 
@@ -173,6 +212,35 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
       .then((res) => setAuthEnabled(res.enabled))
       .catch(() => {});
   }, []);
+
+  useEffect(() => {
+    if (!isMobile && shouldShowDesktopModeHint(window.localStorage)) {
+      setDesktopModeHintOpen(true);
+    }
+  }, [isMobile]);
+
+  const dismissDesktopHint = useCallback(() => {
+    dismissDesktopModeHint(window.localStorage);
+    setDesktopModeHintOpen(false);
+  }, []);
+
+  const desktopModeHintSteps = useMemo<TourProps["steps"]>(
+    () => [
+      {
+        title: t("sidebar.desktopModeHint.title", "Try Desktop Mode"),
+        description: t(
+          "sidebar.desktopModeHint.description",
+          "Open quick settings here, then choose Desktop Mode for a window-based workspace.",
+        ),
+        target: () => settingsButtonRef.current as HTMLButtonElement,
+        placement: "rightBottom",
+        nextButtonProps: {
+          children: t("sidebar.desktopModeHint.gotIt", "Got it"),
+        },
+      },
+    ],
+    [t],
+  );
 
   useEffect(() => {
     if (
@@ -208,9 +276,17 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
           api.getPushMessages(),
         ]);
         const hasUnreadEvents = (inboxRes?.events?.length || 0) > 0;
-        const hasPendingApprovals =
-          (pushRes?.pending_approvals?.length || 0) > 0;
-        setHasInboxUnread(hasUnreadEvents || hasPendingApprovals);
+        const approvals = pushRes?.pending_approvals || [];
+        const currentIds = new Set(
+          approvals.map((a: { request_id: string }) => a.request_id),
+        );
+        currentApprovalIdsRef.current = currentIds;
+        const hasNewApprovals =
+          currentIds.size > 0 &&
+          [...currentIds].some((id) => !seenApprovalIdsRef.current.has(id));
+        setShakeInbox(hasNewApprovals);
+        setHasUnreadMessages(hasUnreadEvents);
+        setHasPendingApprovals(currentIds.size > 0);
       } catch {
         // Keep previous state when polling fails.
       }
@@ -249,23 +325,65 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
     };
   }, []);
 
+  // ── Inbox badge dot & wobble ─────────────────────────────────────────────
+  const hasInboxUnread = hasUnreadMessages || hasPendingApprovals;
+  const inboxDotColor = hasPendingApprovals
+    ? "#e04848"
+    : "rgba(255, 157, 77, 1)";
+  const effectiveShake = shakeInbox && wobbleEnabled;
+
   // ── Adapter: convert MenuItem trees to antd, with inbox badge decoration.
+
+  /** Mark current approvals as "seen" so the wobble stops. */
+  const handleInboxHover = useCallback(() => {
+    seenApprovalIdsRef.current = new Set(currentApprovalIdsRef.current);
+    setShakeInbox(false);
+  }, []);
+
+  /**
+   * Bridge hover events from the antd Menu `<li>` to our handler.
+   * addEventListener de-duplicates the same function reference, so re-calling
+   * on the same element is harmless; old detached elements are GC'd naturally.
+   */
+  const inboxLiRefCallback = useCallback(
+    (node: HTMLSpanElement | null) => {
+      const li = node?.closest("li");
+      if (!li) return;
+      li.addEventListener("mouseenter", handleInboxHover);
+    },
+    [handleInboxHover],
+  );
 
   /** Wrap the inbox label with the unread-Badge while keeping all other labels intact. */
   const decorateLabel = (item: MenuItem, label: ReactNode): ReactNode => {
     if (item.id !== "core.inbox" || label == null) return label;
     return (
-      <Badge dot={hasInboxUnread} color="rgba(255, 157, 77, 1)" offset={[5, 7]}>
-        <span>{label}</span>
-      </Badge>
+      <span ref={inboxLiRefCallback}>
+        <Badge dot={hasInboxUnread} color={inboxDotColor} offset={[5, 7]}>
+          <span>{label}</span>
+        </Badge>
+      </span>
     );
   };
 
+  const getItemClassName = (item: MenuItem) => {
+    if (item.id === "core.inbox" && effectiveShake) {
+      return styles.inboxShake;
+    }
+    return undefined;
+  };
+
   const agentMenuItems = useMemo(
-    () => toAntdItems(agentMenu, { collapsed, decorateLabel }),
-    // hasInboxUnread closure inside decorateLabel — listed as dep explicitly.
+    () =>
+      toAntdItems(agentMenu, { collapsed, decorateLabel, getItemClassName }),
     // eslint-disable-next-line react-hooks/exhaustive-deps
-    [agentMenu, collapsed, hasInboxUnread],
+    [
+      agentMenu,
+      collapsed,
+      hasUnreadMessages,
+      hasPendingApprovals,
+      effectiveShake,
+    ],
   );
 
   const settingsMenuItems = useMemo(
@@ -300,7 +418,7 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
               width: 6,
               height: 6,
               borderRadius: "50%",
-              background: "rgba(255, 157, 77, 1)",
+              background: inboxDotColor,
             }}
           />
         )}
@@ -316,7 +434,15 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
         ? { ...entry, icon: decorateInboxIcon(entry.icon) }
         : entry,
     );
-  }, [agentMenu, settingsMenu, routes, chatPath, t, hasInboxUnread]);
+  }, [
+    agentMenu,
+    settingsMenu,
+    routes,
+    chatPath,
+    t,
+    hasInboxUnread,
+    inboxDotColor,
+  ]);
 
   // ── Handlers ──────────────────────────────────────────────────────────────
 
@@ -337,31 +463,26 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
    * the chat page will auto-create a new session on mount.
    */
   const handleNewChat = useCallback(() => {
-    const onChatPage =
-      location.pathname.startsWith("/chat") ||
-      location.pathname.startsWith("/coding");
+    const onChatPage = location.pathname.startsWith("/chat");
     if (onChatPage) {
       window.dispatchEvent(new CustomEvent("qwenpaw:sidebar-new-chat"));
     } else {
       sessionStorage.setItem("qwenpaw_pending_new_chat", "1");
-      const mode = codingMode ? "coding" : "chat";
-      navigate(`/${mode}`);
+      navigate("/chat");
     }
-  }, [location.pathname, navigate, codingMode]);
+  }, [location.pathname, navigate]);
 
   /**
    * Session click: navigate directly without relying on ChatSessionInitializer.
-   * buildSessionPath handles coding-mode paths.
    * Resolve realId (backend UUID) to avoid exposing local timestamp in URL.
    */
   const handleSidebarSessionClick = useCallback(
     (sessionId: string) => {
-      const mode = codingMode ? "coding" : "chat";
       const effectiveId = sessionApi.getEffectiveSessionId(sessionId);
-      const targetPath = buildSessionPath(mode, effectiveId);
+      const targetPath = buildChatPath(effectiveId);
       navigate(targetPath);
     },
-    [codingMode, navigate],
+    [navigate],
   );
 
   const handleUpdateProfile = async (values: {
@@ -419,16 +540,20 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
 
   // ── Render ────────────────────────────────────────────────────────────────
 
-  const siderWidth = collapsed ? (isMobile ? 56 : 72) : 240;
-  // Sticky chat is active when on /chat* or /coding routes.
-  const isChatActive =
-    selectedKey === "core.chat" || selectedKey === "core.coding";
+  const isChatActive = selectedKey === "core.chat";
   // `renderIcon` retained for tree-shaking awareness.
   void renderIcon;
 
   // On mobile, the expanded sidebar shows sessions (like simple mode) instead
   // of the full menu — matching the desktop history panel UX.
   const isSimpleExpanded = (sidebarMode === "simple" || isMobile) && !collapsed;
+  const siderWidth = collapsed
+    ? isMobile
+      ? 56
+      : 72
+    : sidebarMode === "simple" && !isMobile
+    ? 280
+    : 240;
 
   return (
     <Sider
@@ -459,11 +584,20 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
                 <button
                   className={`${styles.collapsedNavItem} ${
                     isActive ? styles.collapsedNavItemActive : ""
+                  }${
+                    item.key === "core.inbox" && effectiveShake
+                      ? ` ${styles.inboxShake}`
+                      : ""
                   }`}
-                  onClick={() =>
-                    item.href
-                      ? window.open(item.href, "_blank", "noopener,noreferrer")
-                      : navigate(item.path)
+                  onClick={() => {
+                    if (item.href) {
+                      window.open(item.href, "_blank", "noopener,noreferrer");
+                    } else {
+                      navigate(item.path);
+                    }
+                  }}
+                  onMouseEnter={
+                    item.key === "core.inbox" ? handleInboxHover : undefined
                   }
                 >
                   {item.icon}
@@ -474,65 +608,135 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
         </nav>
       ) : isSimpleExpanded ? (
         <>
-          {/* Simple mode: flat nav items + session list */}
-          <div className={styles.agentScopedSection}>
+          {/* Simple mode: agent context and navigation share one panel. */}
+          <div
+            className={`${styles.agentScopedSection} ${styles.simpleAgentPanel}`}
+          >
             <div className={styles.agentSelectorContainer}>
               <AgentSelector collapsed={collapsed} />
             </div>
-            {/* Flat nav items (no groups) */}
-            <div className={styles.simpleNavItems}>
-              {simpleFlatNav.map((entry) => {
-                const isInbox = entry.key === "core.inbox";
-                const isActive = selectedKey === entry.key;
-                return (
-                  <button
-                    key={entry.key}
-                    className={`${styles.simpleNavItem} ${
-                      isActive ? styles.simpleNavItemActive : ""
-                    }`}
-                    onClick={() =>
-                      entry.href
-                        ? window.open(
-                            entry.href,
-                            "_blank",
-                            "noopener,noreferrer",
-                          )
-                        : navigate(entry.path)
-                    }
-                  >
-                    {isInbox ? (
-                      <span
-                        style={{
-                          position: "relative",
-                          display: "inline-flex",
-                        }}
-                      >
-                        {entry.icon ?? <SparkEmailLine size={16} />}
-                        {hasInboxUnread && (
-                          <span
-                            style={{
-                              position: "absolute",
-                              top: -1,
-                              right: -3,
-                              width: 6,
-                              height: 6,
-                              borderRadius: "50%",
-                              background: "rgba(255, 157, 77, 1)",
-                            }}
-                          />
-                        )}
-                      </span>
-                    ) : (
-                      entry.icon
-                    )}
-                    <span>{entry.label}</span>
-                  </button>
-                );
-              })}
-            </div>
+            <button
+              type="button"
+              className={`${styles.simpleNavItem} ${styles.simpleChatItem} ${
+                isChatActive ? styles.simpleNavItemActive : ""
+              }`}
+              onClick={() => navigate(chatPath)}
+            >
+              <MessageSquareText size={16} />
+              <span>{t("nav.chat")}</span>
+            </button>
+            {simpleInboxEntry && (
+              <button
+                type="button"
+                className={`${styles.simpleNavItem} ${styles.simpleInboxItem} ${
+                  selectedKey === simpleInboxEntry.key
+                    ? styles.simpleNavItemActive
+                    : ""
+                }${effectiveShake ? ` ${styles.inboxShake}` : ""}`}
+                onMouseEnter={handleInboxHover}
+                onClick={() => {
+                  if (simpleInboxEntry.href) {
+                    window.open(
+                      simpleInboxEntry.href,
+                      "_blank",
+                      "noopener,noreferrer",
+                    );
+                  } else {
+                    navigate(simpleInboxEntry.path);
+                  }
+                }}
+              >
+                <span className={styles.simpleInboxIcon}>
+                  {simpleInboxEntry.icon ?? <SparkEmailLine size={16} />}
+                  {hasInboxUnread && (
+                    <span
+                      className={styles.simpleInboxUnreadDot}
+                      style={{ background: inboxDotColor }}
+                    />
+                  )}
+                </span>
+                <span>{simpleInboxEntry.label}</span>
+              </button>
+            )}
+            <button
+              type="button"
+              className={styles.simpleAgentDisclosure}
+              aria-expanded={simpleAgentFunctionsExpanded}
+              aria-controls="simple-agent-functions"
+              aria-label={t(
+                "sidebar.toggleAgentNavigation",
+                "Expand or collapse agent navigation",
+              )}
+              onClick={() =>
+                setSimpleAgentFunctionsExpanded((expanded) => !expanded)
+              }
+            >
+              <span className={styles.simpleAgentDisclosureLine} />
+              <motion.span
+                className={styles.simpleAgentDisclosureHandle}
+                animate={{ rotate: simpleAgentFunctionsExpanded ? 180 : 0 }}
+                transition={
+                  prefersReducedMotion
+                    ? { duration: 0 }
+                    : { duration: 0.22, ease: [0.22, 0.78, 0.24, 1] }
+                }
+              >
+                <ChevronDown size={14} />
+              </motion.span>
+              <span className={styles.simpleAgentDisclosureLine} />
+            </button>
+            <AnimatePresence initial={false}>
+              {simpleAgentFunctionsExpanded && (
+                <motion.div
+                  key="simple-agent-functions"
+                  id="simple-agent-functions"
+                  className={styles.simpleAgentFunctionsMotion}
+                  initial={
+                    prefersReducedMotion
+                      ? false
+                      : { height: 0, opacity: 0, y: -4 }
+                  }
+                  animate={{ height: "auto", opacity: 1, y: 0 }}
+                  exit={{ height: 0, opacity: 0, y: -4 }}
+                  transition={
+                    prefersReducedMotion
+                      ? { duration: 0 }
+                      : { duration: 0.24, ease: [0.22, 0.78, 0.24, 1] }
+                  }
+                >
+                  <div className={styles.simpleNavItems}>
+                    {simpleFoldedNav.map((entry) => {
+                      const isActive = selectedKey === entry.key;
+                      return (
+                        <button
+                          key={entry.key}
+                          className={`${styles.simpleNavItem} ${
+                            isActive ? styles.simpleNavItemActive : ""
+                          }`}
+                          onClick={() => {
+                            if (entry.href) {
+                              window.open(
+                                entry.href,
+                                "_blank",
+                                "noopener,noreferrer",
+                              );
+                            } else {
+                              navigate(entry.path);
+                            }
+                          }}
+                        >
+                          {entry.icon}
+                          <span>{entry.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
           </div>
 
-          {/* Session list — fills remaining space */}
+          {/* Session list — fills the primary space. */}
           <SidebarSessionList
             onNewChat={handleNewChat}
             onSessionClick={handleSidebarSessionClick}
@@ -615,23 +819,25 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
       )}
 
       <div className={styles.collapseToggleContainer}>
-        {!collapsed && (
-          <Popover
-            open={settingsOpen}
-            onOpenChange={setSettingsOpen}
-            placement="topRight"
-            trigger="click"
-            content={
-              <SidebarSettingsPanel onClose={() => setSettingsOpen(false)} />
-            }
-          >
-            <Button
-              type="text"
-              icon={<SparkSettingLine size={18} />}
-              className={styles.collapseToggle}
-            />
-          </Popover>
-        )}
+        {/* Gear stays visible in collapsed state too — otherwise users
+            (especially on mobile, where the sidebar starts collapsed)
+            cannot discover how to restore full mode. */}
+        <Popover
+          open={settingsOpen}
+          onOpenChange={setSettingsOpen}
+          placement={collapsed ? "rightBottom" : "topRight"}
+          trigger="click"
+          content={
+            <SidebarSettingsPanel onClose={() => setSettingsOpen(false)} />
+          }
+        >
+          <Button
+            ref={settingsButtonRef}
+            type="text"
+            icon={<SparkSettingLine size={18} />}
+            className={styles.collapseToggle}
+          />
+        </Popover>
         <Button
           type="text"
           icon={
@@ -645,6 +851,14 @@ export default function Sidebar({ selectedKey }: SidebarProps) {
           className={styles.collapseToggle}
         />
       </div>
+
+      <Tour
+        open={desktopModeHintOpen}
+        steps={desktopModeHintSteps}
+        onClose={dismissDesktopHint}
+        onFinish={dismissDesktopHint}
+        mask={{ color: "rgba(9, 9, 11, 0.2)" }}
+      />
 
       <Modal
         open={accountModalOpen}

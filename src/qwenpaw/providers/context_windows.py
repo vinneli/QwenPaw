@@ -14,9 +14,11 @@ it, so what the UI reports and when compression fires can never diverge.
 Precedence:
 
 1. an explicit per-model ``max_input_length`` configured by the user;
-2. this catalog (skipped for local-serving providers such as Ollama, where
+2. context metadata auto-detected from the provider API;
+3. a positive non-default ``max_input_length`` from provider/catalog data;
+4. this pattern catalog (skipped for local-serving providers such as Ollama,
    the family's cloud window says nothing about a local ``num_ctx``);
-3. :data:`DEFAULT_CONTEXT_WINDOW` (128k).
+5. :data:`DEFAULT_CONTEXT_WINDOW` (128k).
 
 Values are deliberately CONSERVATIVE: a too-small window merely compacts
 earlier, while a too-large one lets the live context grow past what the API
@@ -36,9 +38,9 @@ order entries are written in.
 from __future__ import annotations
 
 # The fallback window when nothing else resolves. Also the default of
-# ``ModelInfo.max_input_length`` — a configured value EQUAL to it is
-# indistinguishable from "unset" and loses to the catalog (documented
-# tradeoff; configure any other value, e.g. 130000, to force ~128k).
+# ``ModelInfo.max_input_length``. ``ModelInfo.max_input_length_configured``
+# keeps an explicit user setting distinguishable from this default, including
+# when the user intentionally chooses exactly 128k.
 DEFAULT_CONTEXT_WINDOW = 128 * 1024
 
 # (pattern, max input tokens) — longest pattern wins (see _PATTERNS below).
@@ -70,8 +72,13 @@ _KNOWN_CONTEXT_WINDOWS: tuple[tuple[str, int], ...] = (
     # --- Google (1.5-pro is 2M; the rest of the family is 1M) --------------
     ("gemini-1.5-pro", 2_097_152),
     ("gemini", 1_048_576),
+    # --- MiniMax (M3 is a 1M-context multimodal flagship; the M2.7 series
+    #     is 204.8k. Legacy M2.5/M2.1/M2 keep the conservative default.) -----
+    ("minimax-m3", 1_000_000),
+    ("minimax-m2.7", 204_800),
     # --- Others -------------------------------------------------------------
     ("kimi-k2", 262_144),
+    ("glm-5.2", 1_000_000),
     ("glm-4.6", 200_000),
     ("grok-4-fast", 2_000_000),
     ("grok-4", 256_000),
@@ -118,19 +125,28 @@ def resolve_context_window(
     model_id: str,
     *,
     configured: int | None = None,
+    configured_is_explicit: bool = False,
     use_catalog: bool = True,
+    auto_detected: int | None = None,
 ) -> int:
-    """Resolve a model's input-context window. The single entry point.
+    """Resolve a model's input-context window by the canonical precedence.
 
-    ``configured`` is the model's ``max_input_length`` from user/provider
-    config; any value other than :data:`DEFAULT_CONTEXT_WINDOW` counts as an
-    explicit setting and wins outright (this is how OpenRouter's API-reported
-    ``context_length`` flows through too — it is written into the field).
-    Otherwise the static catalog answers, unless ``use_catalog`` is False
-    (local-serving providers). Everything else falls back to
-    :data:`DEFAULT_CONTEXT_WINDOW`.
+    Resolution order is an explicit user value, API-detected metadata, a
+    positive non-default provider value, the static pattern catalog when
+    enabled, and finally :data:`DEFAULT_CONTEXT_WINDOW`. An explicit value
+    equal to the default still wins. ``use_catalog`` should be false for
+    local-serving providers whose actual runtime context is deployment
+    specific.
     """
-    if configured is not None and configured != DEFAULT_CONTEXT_WINDOW:
+    if configured is not None and configured_is_explicit:
+        return configured
+    if auto_detected is not None and auto_detected > 0:
+        return auto_detected
+    if (
+        configured is not None
+        and configured > 0
+        and configured != DEFAULT_CONTEXT_WINDOW
+    ):
         return configured
     if use_catalog:
         known = known_context_size(model_id)

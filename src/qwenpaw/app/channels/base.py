@@ -11,6 +11,7 @@ import json
 import logging
 import time
 from abc import ABC
+from pathlib import Path
 from typing import (
     Optional,
     Dict,
@@ -19,6 +20,7 @@ from typing import (
     Union,
     AsyncIterator,
     AsyncGenerator,
+    Awaitable,
     Callable,
     TYPE_CHECKING,
 )
@@ -35,16 +37,17 @@ from qwenpaw.schemas import (
     MessageType,
 )
 
-from .renderer import MessageRenderer, RenderStyle
+from .renderer import ChannelDisplayConfig, MessageRenderer, RenderStyle
 from .schema import ChannelType
 from .access_control import get_access_control_store
 from ...config.utils import load_config
+from ...utils.logging import sanitize_log_value
 
 # Optional callback to enqueue payload (set by manager)
 EnqueueCallback = Optional[Callable[[Any], None]]
 
 # Called when a user-originated reply was sent (channel, user_id, session_id)
-OnReplySent = Optional[Callable[[str, str, str], None]]
+OnReplySent = Optional[Callable[[str, str, str], Awaitable[None]]]
 
 logger = logging.getLogger(__name__)
 
@@ -122,9 +125,7 @@ class BaseChannel(ABC):
         self,
         process: ProcessHandler,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
-        filter_thinking: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
         dm_policy: str = "open",
         group_policy: str = "open",
         allow_from: Optional[list] = None,
@@ -137,9 +138,7 @@ class BaseChannel(ABC):
     ):
         self._process = process
         self._on_reply_sent = on_reply_sent
-        self._show_tool_details = show_tool_details
-        self._filter_tool_messages = filter_tool_messages
-        self._filter_thinking = filter_thinking
+        self._display_config = display_config or ChannelDisplayConfig()
         self._no_text_debounce = no_text_debounce
         self.streaming_enabled = streaming_enabled
         # Legacy fields — stored for backward compat but not used for
@@ -161,9 +160,7 @@ class BaseChannel(ABC):
             if not tc.display_to_user
         )
         self._render_style = RenderStyle(
-            show_tool_details=show_tool_details,
-            filter_tool_messages=filter_tool_messages,
-            filter_thinking=filter_thinking,
+            display_config=self._display_config,
             internal_tools=internal_tools,
         )
         self._renderer = MessageRenderer(self._render_style)
@@ -464,8 +461,6 @@ class BaseChannel(ABC):
 
     def _get_acl_store(self):
         """Get the AccessControlStore for this channel's workspace."""
-        from pathlib import Path
-
         workspace_dir = None
         if self._workspace is not None:
             workspace_dir = Path(self._workspace.workspace_dir)
@@ -554,13 +549,26 @@ class BaseChannel(ABC):
 
         logger.info(
             f"_consume_with_tracker: chat_id={chat.id} "
-            f"session={session_id[:30]}",
+            f"session={sanitize_log_value(session_id[:30])}",
         )
+
+        # Refresh updated_at so the session list surfaces this chat as the
+        # latest activity (issue #6131). get_or_create_chat returns an
+        # existing chat unchanged, so without this the timestamp stays stale.
+        try:
+            await self._workspace.chat_manager.touch_chat(chat.id)
+        except Exception:  # pylint: disable=broad-except
+            logger.debug(
+                "failed to touch chat updated_at: chat_id=%s",
+                chat.id,
+                exc_info=True,
+            )
 
         queue, is_new = await self._workspace.task_tracker.attach_or_start(
             chat.id,
             payload,
             self._stream_with_tracker,
+            owner=self._workspace,
         )
 
         if is_new:
@@ -573,13 +581,14 @@ class BaseChannel(ABC):
             except asyncio.CancelledError:
                 logger.info(
                     f"Task cancelled: chat_id={chat.id} "
-                    f"session={session_id[:30]}",
+                    f"session={sanitize_log_value(session_id[:30])}",
                 )
                 raise
         else:
             logger.warning(
                 f"Message ignored (task already running): "
-                f"chat_id={chat.id} session={session_id[:30]}. "
+                f"chat_id={chat.id} "
+                f"session={sanitize_log_value(session_id[:30])}. "
                 f"This should not happen with UnifiedQueueManager.",
             )
 
@@ -664,7 +673,10 @@ class BaseChannel(ABC):
         msg_id = getattr(event, "id", None)
         if msg_id:
             msg_id_to_stream_type[msg_id] = stream_type
-        if stream_type == "reasoning" and self._filter_thinking:
+        if (
+            stream_type == "reasoning"
+            and not self._display_config.show_thinking
+        ):
             return True
         streaming_buffers[stream_type] = ""
         await self.on_streaming_start(
@@ -699,7 +711,10 @@ class BaseChannel(ABC):
             or stream_type not in streaming_buffers
         ):
             return False
-        if stream_type == "reasoning" and self._filter_thinking:
+        if (
+            stream_type == "reasoning"
+            and not self._display_config.show_thinking
+        ):
             return True
 
         # Detect content index change → split into a new streaming box
@@ -780,6 +795,9 @@ class BaseChannel(ABC):
 
         # Fire-and-forget flush
         flush_meta["last_ts"] = now
+        from qwenpaw.agents.context.scroll.serialize import strip_headline
+
+        display_text = strip_headline(streaming_buffers[stream_type]) or ""
         flush_meta["task"] = asyncio.create_task(
             self._safe_streaming_delta(
                 request,
@@ -787,7 +805,7 @@ class BaseChannel(ABC):
                 event,
                 send_meta,
                 stream_type,
-                streaming_buffers[stream_type],
+                display_text,
             ),
         )
         return True
@@ -808,7 +826,10 @@ class BaseChannel(ABC):
         if stream_type not in self._STREAMABLE_TYPES:
             return False
         if stream_type in streaming_buffers:
-            if stream_type == "reasoning" and self._filter_thinking:
+            if (
+                stream_type == "reasoning"
+                and not self._display_config.show_thinking
+            ):
                 streaming_buffers.pop(stream_type, None)
                 return True
 
@@ -838,6 +859,9 @@ class BaseChannel(ABC):
 
             buf = streaming_buffers.pop(stream_type, "")
             accumulated = self._extract_text_from_event(event) or buf
+            from qwenpaw.agents.context.scroll.serialize import strip_headline
+
+            accumulated = strip_headline(accumulated) or ""
             await self.on_streaming_end(
                 request,
                 to_handle,
@@ -889,6 +913,8 @@ class BaseChannel(ABC):
             send_meta = {**send_meta, "bot_prefix": bot_prefix}
 
         to_handle = self.get_to_handle_from_request(request)
+        session_id = getattr(request, "session_id", "") or ""
+        self._clear_session_turn_usage(session_id)
 
         await self._before_consume_process(request)
 
@@ -896,15 +922,35 @@ class BaseChannel(ABC):
         process_iterator = None
         msg_id_to_stream_type: Dict[str, str] = {}
         streaming_buffers: Dict[str, str] = {}
+        headline_stream_states: dict[str, Any] = {}
         try:
             process_iterator = self._process(request)
             async for event in process_iterator:
-                data = self._serialize_event_for_sse(event)
-
-                yield f"data: {data}\n\n"
-
                 obj = getattr(event, "object", None)
                 status = getattr(event, "status", None)
+                if obj == "message" and status == RunStatus.Completed:
+                    msg_id = str(
+                        getattr(event, "msg_id", "")
+                        or getattr(event, "id", "")
+                        or "",
+                    )
+                    for pending_data in self._flush_headline_stream_states(
+                        headline_stream_states,
+                        msg_id=msg_id,
+                    ):
+                        yield f"data: {pending_data}\n\n"
+                elif obj == "response" and status == RunStatus.Completed:
+                    for pending_data in self._flush_headline_stream_states(
+                        headline_stream_states,
+                    ):
+                        yield f"data: {pending_data}\n\n"
+
+                data = self._serialize_event_for_sse(
+                    event,
+                    headline_stream_states,
+                )
+
+                yield f"data: {data}\n\n"
 
                 # --- streaming path ---
                 handled_by_streaming = False
@@ -937,12 +983,23 @@ class BaseChannel(ABC):
                             event,
                             send_meta,
                         )
+                    await self._send_model_fallback_notice(
+                        to_handle,
+                        event,
+                        send_meta,
+                    )
                 elif obj == "response":
                     last_response = event
                     await self.on_event_response(request, event)
 
+            for pending_data in self._flush_headline_stream_states(
+                headline_stream_states,
+            ):
+                yield f"data: {pending_data}\n\n"
+
             err_msg = self._get_response_error_message(last_response)
             if err_msg:
+                self._clear_session_turn_usage(session_id)
                 await self._on_consume_error(
                     request,
                     to_handle,
@@ -954,16 +1011,24 @@ class BaseChannel(ABC):
                     to_handle,
                     send_meta,
                 )
+                for sse in await self._commit_turn_usage(
+                    request,
+                    session_id,
+                    emit_sse=True,
+                ):
+                    yield sse
 
             if self._on_reply_sent:
                 args = self.get_on_reply_sent_args(request, to_handle)
-                self._on_reply_sent(self.channel, *args)
+                await self._on_reply_sent(self.channel, *args)
 
         except asyncio.CancelledError:
+            raw_session = getattr(request, "session_id", "")
             logger.info(
-                f"channel task cancelled: "
-                f"session={getattr(request, 'session_id', '')[:30]}",
+                "channel task cancelled: session="
+                f"{sanitize_log_value(raw_session)[:34]}",
             )
+            self._clear_session_turn_usage(session_id)
             if process_iterator is not None:
                 await process_iterator.aclose()
             raise
@@ -974,12 +1039,15 @@ class BaseChannel(ABC):
                 f"session={getattr(request, 'session_id', 'N/A')[:30]}, "
                 f"agent={to_handle}",
             )
+            self._clear_session_turn_usage(session_id)
             await self._on_consume_error(
                 request,
                 to_handle,
                 "Internal error",
             )
             raise
+        finally:
+            await self._finish_response_cycle(session_id)
 
     @staticmethod
     def _sanitize_surrogate_text(text: str) -> str:
@@ -1011,7 +1079,11 @@ class BaseChannel(ABC):
         return value
 
     @staticmethod
-    def _strip_event_headlines(event: Any, fallback: str) -> str:
+    def _strip_event_headlines(
+        event: Any,
+        fallback: str,
+        headline_stream_states: dict[str, Any] | None = None,
+    ) -> str:
         """Drop scroll headlines (``<!-- ⟦ … ⟧ -->``) from an SSE payload.
 
         Channels strip headlines via ``MessageRenderer``, but this raw-event
@@ -1021,30 +1093,63 @@ class BaseChannel(ABC):
         the headline verbatim (those go through separate paths). A no-op on any
         text block that holds no headline, so user/tool text is untouched.
         """
-        from qwenpaw.agents.context.scroll.serialize import strip_headline
+        from qwenpaw.agents.context.scroll.serialize import (
+            HeadlineDeltaState,
+            strip_headline,
+            strip_headline_delta,
+        )
 
         try:
             payload = event.model_dump(mode="json")
         except Exception:  # noqa: BLE001 - fall back to the unstripped data
             return fallback
 
-        def walk(node: Any) -> None:
-            if isinstance(node, dict):
-                if node.get("type") == "text" and isinstance(
-                    node.get("text"),
-                    str,
-                ):
-                    node["text"] = strip_headline(node["text"])
-                for value in node.values():
-                    walk(value)
-            elif isinstance(node, list):
-                for value in node:
-                    walk(value)
+        # A content delta may split the protocol line over several events.
+        # Track that state inside the current SSE request rather than on the
+        # shared channel instance, where concurrent sessions could interfere.
+        if (
+            headline_stream_states is not None
+            and getattr(event, "object", None) == "content"
+            and getattr(event, "delta", False)
+        ):
+            msg_id = str(getattr(event, "msg_id", "") or "")
+            index = int(getattr(event, "index", 0) or 0)
+            stream_key = f"{msg_id}:{index}"
+            raw_text = getattr(event, "text", "") or ""
+            state = headline_stream_states.get(
+                stream_key,
+                HeadlineDeltaState(),
+            )
+            clean_text, state = strip_headline_delta(
+                raw_text,
+                state=state,
+            )
+            if isinstance(payload, dict) and "text" in payload:
+                payload["text"] = clean_text
+            if state.suppressing or state.pending:
+                headline_stream_states[stream_key] = state
+            else:
+                headline_stream_states.pop(stream_key, None)
 
-        walk(payload)
+        def walk(node: Any) -> Any:
+            if isinstance(node, str):
+                return strip_headline(node)
+            if isinstance(node, dict):
+                for key, value in list(node.items()):
+                    node[key] = walk(value)
+                return node
+            if isinstance(node, list):
+                return [walk(value) for value in node]
+            return node
+
+        payload = walk(payload)
         return json.dumps(payload, ensure_ascii=False, default=str)
 
-    def _serialize_event_for_sse(self, event: Any) -> str:
+    def _serialize_event_for_sse(
+        self,
+        event: Any,
+        headline_stream_states: dict[str, Any] | None = None,
+    ) -> str:
         try:
             if hasattr(event, "model_dump_json"):
                 data = event.model_dump_json()
@@ -1056,8 +1161,23 @@ class BaseChannel(ABC):
             # Headlines reach the UI only through this raw-event path; rewrite
             # to strip them, but only when a fence marker is actually present
             # so the common (headline-free) event pays nothing.
-            if hasattr(event, "model_dump") and ("⟦" in data or "〚" in data):
-                data = self._strip_event_headlines(event, data)
+            is_tracked_delta = (
+                headline_stream_states is not None
+                and getattr(event, "object", None) == "content"
+                and getattr(event, "delta", False)
+            )
+            should_strip = (
+                "⟦" in data
+                or "〚" in data
+                or bool(headline_stream_states)
+                or is_tracked_delta
+            )
+            if hasattr(event, "model_dump") and should_strip:
+                data = self._strip_event_headlines(
+                    event,
+                    data,
+                    headline_stream_states,
+                )
 
             return self._sanitize_surrogate_text(data)
 
@@ -1088,6 +1208,46 @@ class BaseChannel(ABC):
                     ensure_ascii=True,
                 )
 
+    @staticmethod
+    def _flush_headline_stream_states(
+        headline_stream_states: dict[str, Any],
+        *,
+        msg_id: str | None = None,
+    ) -> list[str]:
+        """Finalize buffered marker prefixes as ordinary content deltas."""
+        from qwenpaw.agents.context.scroll.serialize import (
+            flush_headline_delta,
+        )
+
+        flushed: list[str] = []
+        for stream_key, state in list(headline_stream_states.items()):
+            stream_msg_id, separator, raw_index = stream_key.rpartition(":")
+            if not separator:
+                stream_msg_id, raw_index = stream_key, "0"
+            if msg_id is not None and stream_msg_id != msg_id:
+                continue
+            headline_stream_states.pop(stream_key, None)
+            text = flush_headline_delta(state)
+            if not text:
+                continue
+            try:
+                index = int(raw_index)
+            except ValueError:
+                index = 0
+            flushed.append(
+                json.dumps(
+                    {
+                        "object": "content",
+                        "delta": True,
+                        "msg_id": stream_msg_id,
+                        "index": index,
+                        "text": text,
+                    },
+                    ensure_ascii=False,
+                ),
+            )
+        return flushed
+
     @classmethod
     def from_env(
         cls,
@@ -1102,10 +1262,8 @@ class BaseChannel(ABC):
         process: ProcessHandler,
         config: Any,
         on_reply_sent: OnReplySent = None,
-        show_tool_details: bool = True,
-        filter_tool_messages: bool = False,
+        display_config: ChannelDisplayConfig | None = None,
         no_text_debounce: bool = True,
-        filter_thinking: bool = False,
     ) -> "BaseChannel":
         raise NotImplementedError
 
@@ -1395,6 +1553,8 @@ class BaseChannel(ABC):
         loop (e.g. DingTalk _process_one_request with webhook sends).
         """
         last_response = None
+        session_id = getattr(request, "session_id", "") or ""
+        self._clear_session_turn_usage(session_id)
         try:
             async for event in self._process(request):
                 obj = getattr(event, "object", None)
@@ -1414,11 +1574,17 @@ class BaseChannel(ABC):
                         event,
                         send_meta,
                     )
+                    await self._send_model_fallback_notice(
+                        to_handle,
+                        event,
+                        send_meta,
+                    )
                 elif obj == "response":
                     last_response = event
                     await self.on_event_response(request, event)
             err_msg = self._get_response_error_message(last_response)
             if err_msg:
+                self._clear_session_turn_usage(session_id)
                 await self._on_consume_error(
                     request,
                     to_handle,
@@ -1430,16 +1596,31 @@ class BaseChannel(ABC):
                     to_handle,
                     send_meta,
                 )
+                await self._commit_turn_usage(
+                    request,
+                    session_id,
+                    emit_sse=False,
+                )
             if self._on_reply_sent:
                 args = self.get_on_reply_sent_args(request, to_handle)
-                self._on_reply_sent(self.channel, *args)
+                await self._on_reply_sent(self.channel, *args)
+        except asyncio.CancelledError:
+            logger.info(
+                "channel task cancelled: session=%s",
+                getattr(request, "session_id", "")[:30],
+            )
+            self._clear_session_turn_usage(session_id)
+            raise
         except Exception:
             logger.exception("channel consume_one failed")
+            self._clear_session_turn_usage(session_id)
             await self._on_consume_error(
                 request,
                 to_handle,
                 "An error occurred while processing your request.",
             )
+        finally:
+            await self._finish_response_cycle(session_id)
 
     def _get_response_error_message(self, last_response: Any) -> Optional[str]:
         """
@@ -1482,7 +1663,7 @@ class BaseChannel(ABC):
         status = getattr(event, "status", None)
         if status != RunStatus.InProgress:
             return False
-        if self._filter_tool_messages:
+        if not self._display_config.show_tool_results:
             return False
         data = getattr(event, "data", None) or {}
         if not isinstance(data, dict) or "output" not in data:
@@ -1604,6 +1785,86 @@ class BaseChannel(ABC):
         """
         await self.send_message_content(to_handle, event, send_meta)
 
+    @staticmethod
+    def _model_fallback_events(event: Any) -> List[Dict[str, str]]:
+        """Return valid, unique model fallback events from message metadata."""
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict):
+            message = getattr(event, "message", None)
+            metadata = getattr(message, "metadata", None)
+        if not isinstance(metadata, dict):
+            return []
+
+        nested_metadata = metadata.get("metadata")
+        event_source = (
+            nested_metadata if isinstance(nested_metadata, dict) else metadata
+        )
+        raw_events = event_source.get("qwenpaw_model_fallbacks")
+        if not isinstance(raw_events, list):
+            return []
+
+        required_fields = (
+            "from_provider_id",
+            "from_model_id",
+            "to_provider_id",
+            "to_model_id",
+            "reason_kind",
+        )
+        events: List[Dict[str, str]] = []
+        seen: set[tuple[str, ...]] = set()
+        for raw_event in raw_events:
+            if not isinstance(raw_event, dict):
+                continue
+            if raw_event.get("type") != "model_fallback":
+                continue
+            if not all(
+                isinstance(raw_event.get(field), str)
+                for field in required_fields
+            ):
+                continue
+            event_key = tuple(
+                str(raw_event[field]) for field in required_fields
+            )
+            if event_key in seen:
+                continue
+            seen.add(event_key)
+            events.append(
+                {field: str(raw_event[field]) for field in required_fields},
+            )
+        return events
+
+    @staticmethod
+    def _format_model_fallback_notice(event: Dict[str, str]) -> str:
+        """Format one model fallback event for channel users."""
+        source = f"{event['from_provider_id']}:{event['from_model_id']}"
+        target = f"{event['to_provider_id']}:{event['to_model_id']}"
+        return (
+            f"Model switched from {source} to {target} "
+            f"({event['reason_kind']})."
+        )
+
+    async def _send_model_fallback_notice(
+        self,
+        to_handle: str,
+        event: Any,
+        send_meta: Dict[str, Any],
+    ) -> None:
+        """Send fallback metadata to channels without Console rendering."""
+        if self.channel == "console":
+            return
+        fallback_events = self._model_fallback_events(event)
+        if not fallback_events:
+            return
+        notice = "\n".join(
+            self._format_model_fallback_notice(item)
+            for item in fallback_events
+        )
+        await self.send_content_parts(
+            to_handle,
+            [TextContent(type=ContentType.TEXT, text=notice)],
+            send_meta,
+        )
+
     async def on_event_response(
         self,
         request: "AgentRequest",
@@ -1620,6 +1881,122 @@ class BaseChannel(ABC):
         """Hook called after all events processed without error.
 
         Override for post-processing (e.g. Feishu DONE reaction).
+        """
+
+    async def _finish_response_cycle(self, session_id: str) -> None:
+        """Run best-effort browser cleanup after one channel response cycle."""
+        if not session_id or self._workspace is None:
+            return
+        workspace_dir = getattr(self._workspace, "workspace_dir", None)
+        if workspace_dir is None:
+            return
+        try:
+            from ...browser.execution.kernel import get_default_kernel_manager
+            from ...browser.tool_entrypoint import derive_workspace_id
+
+            await get_default_kernel_manager().on_response_cycle_end(
+                derive_workspace_id(Path(workspace_dir)),
+                session_id,
+            )
+        # Intentional boundary: provider cleanup cannot fail a channel reply.
+        except Exception:
+            logger.warning(
+                "browser response-cycle cleanup failed for session=%s",
+                session_id[:30],
+                exc_info=True,
+            )
+
+    @staticmethod
+    def _clear_session_turn_usage(session_id: str) -> None:
+        """Drop any staged per-session usage (turn start / cancel / error)."""
+        if not session_id:
+            return
+        import importlib
+
+        mod = importlib.import_module("qwenpaw.token_usage.model_wrapper")
+        mod.TokenRecordingModelWrapper.pop_usage_for_session(session_id)
+
+    async def _commit_turn_usage(
+        self,
+        request: "AgentRequest",
+        session_id: str,
+        *,
+        emit_sse: bool = True,
+    ) -> List[str]:
+        """Resolve, persist, and optionally emit a ``turn_usage`` SSE."""
+        if not session_id:
+            return []
+        try:
+            import importlib
+
+            turn_usage = importlib.import_module(
+                "qwenpaw.token_usage.turn_usage",
+            )
+            token_usage = importlib.import_module("qwenpaw.token_usage")
+
+            workspace = self._workspace
+            session = (
+                getattr(workspace, "session", None)
+                if workspace is not None
+                else None
+            )
+            agent_id = (
+                getattr(workspace, "agent_id", "default")
+                if workspace is not None
+                else "default"
+            )
+            user_id = getattr(request, "user_id", "") or ""
+            channel = getattr(request, "channel", "") or self.channel
+            turn, ctx, agent_state = await turn_usage.resolve_turn_usage(
+                session_id=session_id,
+                agent_id=agent_id,
+                session=session,
+                user_id=user_id,
+                channel=channel,
+            )
+            if turn is None and ctx is None:
+                return []
+            self._on_turn_usage_ready(turn, ctx)
+            if turn:
+                logger.info("Usage for session %s: %s", session_id, turn)
+            if session is not None:
+                try:
+                    await token_usage.persist_turn_usage(
+                        session=session,
+                        session_id=session_id,
+                        user_id=user_id,
+                        channel=channel,
+                        turn=turn,
+                        ctx=ctx,
+                        agent_state=agent_state,
+                    )
+                except Exception:
+                    logger.warning(
+                        "turn usage persist skipped",
+                        exc_info=True,
+                    )
+            if not emit_sse:
+                return []
+            payload: Dict[str, Any] = {
+                "type": "turn_usage",
+                "session_id": session_id,
+                "usage": turn,
+                "context_usage": ctx,
+            }
+            return [
+                f"data: {json.dumps(payload, ensure_ascii=False)}\n\n",
+            ]
+        except Exception:
+            logger.warning("turn usage commit skipped", exc_info=True)
+            return []
+
+    def _on_turn_usage_ready(
+        self,
+        turn: Optional[Dict[str, Any]],
+        ctx: Optional[Dict[str, Any]],
+    ) -> None:
+        """Hook: channel-specific side effect once per-turn usage is staged
+        (e.g. console prints a terminal status line). Default: no-op.
         """
 
     async def _on_consume_error(
@@ -1847,24 +2224,16 @@ class BaseChannel(ABC):
 
         Subclasses must implement from_config(process, config, on_reply_sent).
 
-        show_tool_details is global config (not in channel config), so we
-        preserve from self. filter_tool_messages and filter_thinking are
-        per-channel config, so we read from new config.
+        Global tool detail visibility is preserved while per-channel display
+        settings are reloaded from the new configuration.
         """
         return self.__class__.from_config(
             process=self._process,
             config=config,
             on_reply_sent=self._on_reply_sent,
-            show_tool_details=getattr(self, "_show_tool_details", True),
-            filter_tool_messages=getattr(
+            display_config=ChannelDisplayConfig.from_config(
                 config,
-                "filter_tool_messages",
-                False,
-            ),
-            filter_thinking=getattr(
-                config,
-                "filter_thinking",
-                False,
+                show_tool_details=self._display_config.show_tool_details,
             ),
         )
 
@@ -1937,6 +2306,7 @@ class BaseChannel(ABC):
             session_id=session_id,
         )
         await self.send_message_content(to_handle, event, meta)
+        await self._send_model_fallback_notice(to_handle, event, meta or {})
 
     async def send_approval_notification(
         self,

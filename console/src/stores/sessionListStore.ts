@@ -11,6 +11,8 @@
  */
 import { create } from "zustand";
 import type { IAgentScopeRuntimeWebUISession } from "@agentscope-ai/chat";
+import type { ChatSource } from "../api/types/chat";
+import { useAgentStore } from "./agentStore";
 
 export interface ExtendedSession extends IAgentScopeRuntimeWebUISession {
   realId?: string;
@@ -23,6 +25,12 @@ export interface ExtendedSession extends IAgentScopeRuntimeWebUISession {
   status?: string;
   generating?: boolean;
   pinned?: boolean;
+  archivedAt?: string | null;
+  archived?: boolean;
+  source?: ChatSource;
+  groupId?: string | null;
+  parentSessionId?: string | null;
+  rootSessionId?: string | null;
 }
 
 interface SessionListStore {
@@ -73,3 +81,14 @@ export const useSessionListStore = create<SessionListStore>((set, get) => ({
 export function syncSessionsGlobal(sessions: ExtendedSession[]) {
   useSessionListStore.getState().syncSessions(sessions);
 }
+
+// The shared list belongs to one agent at a time. Clear it synchronously on
+// every agent change so consumers (e.g. the simple-mode sidebar) never keep
+// rendering — and navigating to — the previous agent's sessions while the
+// new agent's list is still loading. The library setter stays registered:
+// it belongs to the mounted initializer, which re-syncs after the switch.
+useAgentStore.subscribe((state, prevState) => {
+  if (state.selectedAgent !== prevState.selectedAgent) {
+    useSessionListStore.setState({ sessions: [], lastUpdated: Date.now() });
+  }
+});

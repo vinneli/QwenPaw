@@ -9,12 +9,23 @@ import logging
 from pathlib import Path
 from typing import Any, TYPE_CHECKING
 
-from agentscope.message import Msg, TextBlock
+from agentscope.message import HintBlock, Msg, TextBlock
 
+from .context.scroll.continuation_summary import (
+    ContinuationSummary,
+    redact_secrets,
+)
+from .middlewares import (
+    discard_auto_memory_turns,
+    manual_compact_memory_by_handler,
+    reset_auto_memory_turn_state,
+)
 from .utils.context_stats import format_history_str
 from ..config.config import load_agent_config, get_model_max_input_length
 from ..constant import DEBUG_HISTORY_FILE, MAX_LOAD_HISTORY_COUNT
 from ..exceptions import SystemCommandException
+from ..loop.gates.runner import clear_pending_gate_state
+from ..utils.io_utils import run_sync_io
 
 if TYPE_CHECKING:
     from agentscope.agent import Agent
@@ -49,6 +60,7 @@ SYSTEM_COMMAND_DESCRIPTIONS: dict[str, str] = {
 # directly; the field is constrained ``gt=0``, so we use a negligible value
 # rather than zero.
 _FORCE_TRIGGER_RATIO = 1e-6
+_MAX_COMPACT_HINT_CHARS = 2000
 
 
 def _fmt_tokens(n: int) -> str:
@@ -79,6 +91,7 @@ class ConversationCommandHandlerMixin:
             "system_prompt",
             "dream",
             "memorize",
+            "reme_status",
         },
     )
 
@@ -184,6 +197,10 @@ class CommandHandler(ConversationCommandHandlerMixin):
             return load_agent_config(self.memory_manager.agent_id)
         return load_agent_config(self._agent_id)
 
+    async def _get_agent_config_async(self):
+        """Get hot-reloaded agent config without blocking the event loop."""
+        return await run_sync_io(self._get_agent_config)
+
     # ------------------------------------------------------------------
     # State accessors — short-term memory lives on ``agent.state``
     # or the directly-provided ``_state_direct``.
@@ -205,6 +222,32 @@ class CommandHandler(ConversationCommandHandlerMixin):
     def _set_summary(self, value: str) -> None:
         """Write the rolling compaction summary."""
         self._state.summary = value or ""
+
+    async def _reset_modes(
+        self,
+    ) -> None:
+        """Reset mode-owned state on /new or /clear."""
+        ctx = self._prompt_context
+        if ctx is None:
+            clear_pending_gate_state(self._agent)
+            return
+        if getattr(ctx, "agent", None) is None and self._agent is not None:
+            ctx.agent = self._agent
+
+        for mode in getattr(
+            getattr(getattr(ctx, "workspace", None), "plugins", None),
+            "modes",
+            [],
+        ):
+            try:
+                await mode.on_conversation_reset(ctx)
+            except Exception:  # noqa: BLE001
+                logger.warning(
+                    "mode '%s' reset raised",
+                    getattr(mode, "name", "?"),
+                    exc_info=True,
+                )
+        clear_pending_gate_state(getattr(ctx, "agent", None) or self._agent)
 
     def is_command(self, query: str | None) -> bool:
         """Check if the query is a system command (alias for mixin)."""
@@ -232,8 +275,9 @@ class CommandHandler(ConversationCommandHandlerMixin):
         )
 
     def _has_memory_manager(self) -> bool:
-        """Check if memory manager is available."""
-        return self.memory_manager is not None
+        """Return whether a functional memory manager is enabled."""
+        manager = self.memory_manager
+        return manager is not None and getattr(manager, "enabled", True)
 
     def _current_session_id(self) -> str:
         """Resolve the active session id on a best-effort basis.
@@ -278,10 +322,18 @@ class CommandHandler(ConversationCommandHandlerMixin):
             )
             return base
 
-    async def _process_compact(
+    @staticmethod
+    def _compact_instructions(args: str) -> HintBlock | None:
+        """Build bounded, secret-safe guidance for one manual compaction."""
+        safe_hint = redact_secrets(args.strip())[:_MAX_COMPACT_HINT_CHARS]
+        if not safe_hint:
+            return None
+        return HintBlock(hint=safe_hint, source="user")
+
+    async def _process_compact(  # pylint: disable=too-many-statements
         self,
         messages: list[Msg],
-        args: str = "",  # pylint: disable=unused-argument
+        args: str = "",
     ) -> Msg:
         """Process /compact command.
 
@@ -296,7 +348,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
                 "- No action taken",
             )
 
-        agent_config = self._get_agent_config()
+        agent_config = await self._get_agent_config_async()
         compact_config = (
             agent_config.running.light_context_config.context_compact_config
         )
@@ -311,7 +363,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
 
         agent = self._agent
         if agent is None:
-            agent = await self._build_tmp_agent()
+            agent = await self._build_tmp_agent(agent_config)
             if agent is None:
                 return await self._make_system_msg(
                     "🚫 **Compact failed — could not initialise model.**\n\n"
@@ -321,11 +373,13 @@ class CommandHandler(ConversationCommandHandlerMixin):
         # Manual command: force compaction, and measure before/after so the
         # reply reports what was actually evicted.
         forced_cfg = self._forced_context_config(agent)
+        instructions = self._compact_instructions(args)
         before = len(self._state.context)
         # Scroll keeps its compaction map in the eviction index
         # (``state.summary`` stays empty); native fills ``state.summary``.
         # Capture whichever applies.
         index_text = ""
+        continuation_text = ""
         compress_stats: dict = {}
         try:
             # Agent-backed mode: ``QwenPawAgent.compress_context`` already
@@ -334,22 +388,34 @@ class CommandHandler(ConversationCommandHandlerMixin):
             # native, so under the scroll strategy we drive the scroll manager
             # directly here. Native sessions fall through untouched.
             scroll_mgr = (
-                self._build_standalone_scroll_manager()
+                await self._build_standalone_scroll_manager(
+                    agent_config,
+                )
                 if self._agent is None
                 else None
             )
             if scroll_mgr is not None:
                 try:
                     scroll_mgr.load_state(self._scroll_state or {})
-                    await scroll_mgr.compress(agent, forced_cfg)
+                    await scroll_mgr.compress(
+                        agent,
+                        forced_cfg,
+                        instructions=instructions,
+                    )
                     self._updated_scroll_state = scroll_mgr.to_dict()
                     index_text = scroll_mgr.describe_index()
+                    continuation_text = scroll_mgr.describe_summary()
                     compress_stats = dict(scroll_mgr.last_compress)
                 finally:
-                    scroll_mgr.close()
+                    await run_sync_io(scroll_mgr.close)
             else:
-                await agent.compress_context(forced_cfg)
+                with manual_compact_memory_by_handler():
+                    await agent.compress_context(
+                        forced_cfg,
+                        instructions=instructions,
+                    )
                 index_text = self._scroll_index_text(agent)
+                continuation_text = self._scroll_summary_text(agent)
                 cm = getattr(agent, "_context_manager", None)
                 compress_stats = dict(
                     getattr(cm, "last_compress", None) or {},
@@ -362,26 +428,38 @@ class CommandHandler(ConversationCommandHandlerMixin):
             )
 
         after = len(self._state.context)
-        evicted = max(0, before - after)
-        reme_cfg = agent_config.running.reme_light_memory_config
-        if self._has_memory_manager() and reme_cfg.summarize_when_compact:
+        inferred_evicted = max(0, before - after)
+        evicted = int(
+            compress_stats.get("evicted", inferred_evicted) or 0,
+        )
+        if self._has_memory_manager():
             self.memory_manager.add_summarize_task(
                 messages=messages,
                 session_id=self._current_session_id(),
             )
+            self._discard_submitted_pending_markers(messages)
 
         summary = self._get_summary()
         folded = int(compress_stats.get("folded", 0) or 0)
-        if evicted == 0 and folded == 0 and not summary and not index_text:
+        if evicted == 0 and folded == 0 and (bool(index_text) or not summary):
             return await self._make_system_msg(
                 "ℹ️ **Nothing to compact.**\n\n"
                 f"- Context is already minimal ({before} message(s))\n"
                 "- No turns were evicted",
             )
         if index_text:
-            detail = f"**Eviction Index:**\n{index_text}\n"
+            summary_line = (
+                "- Continuation summary: available via `/compact_str`\n"
+                if continuation_text
+                else "- Continuation summary: unavailable; archived "
+                "turns remain recoverable\n"
+            )
+            detail = (
+                f"{summary_line}"
+                "- Older turns remain recoverable through Scroll history\n"
+            )
         else:
-            detail = f"**Compressed Summary:**\n{summary}\n"
+            detail = f"**Compressed Summary:**\n{summary}\n" if summary else ""
         # The fold rewrites tool results in place (message count unchanged),
         # so it must be reported explicitly — a fold-only run used to claim
         # "Nothing to compact" while live outputs were replaced with stubs.
@@ -390,48 +468,102 @@ class CommandHandler(ConversationCommandHandlerMixin):
             if folded
             else ""
         )
+        action_label = (
+            "Messages archived"
+            if compress_stats or index_text
+            else "Messages compacted"
+        )
         return await self._make_system_msg(
             f"✅ **Compact Complete!**\n\n"
-            f"- Messages compacted: {evicted}\n"
+            f"- {action_label}: {evicted}\n"
             f"{folded_line}"
             f"{detail}",
         )
+
+    def _discard_submitted_pending_markers(
+        self,
+        messages: list[Msg],
+    ) -> None:
+        """Remove pending turns covered by the manual compact task."""
+        submitted = {msg.id for msg in messages if msg.id}
+        discard_auto_memory_turns(self._state, submitted)
 
     @staticmethod
     def _scroll_index_text(agent: "Agent") -> str:
         """Scroll eviction-index map for a live agent, or '' under native."""
         cm = getattr(agent, "_context_manager", None)
         if cm is not None and hasattr(cm, "describe_index"):
-            return cm.describe_index()
+            value = cm.describe_index()
+            return value if isinstance(value, str) else ""
         return ""
 
     @staticmethod
+    def _scroll_summary_text(agent: "Agent") -> str:
+        """Scroll continuation state for a live agent, else an empty string."""
+        cm = getattr(agent, "_context_manager", None)
+        if cm is not None and hasattr(cm, "describe_summary"):
+            value = cm.describe_summary()
+            return value if isinstance(value, str) else ""
+        return ""
+
+    def _stored_scroll_summary_text(self) -> str:
+        """Render the persisted Scroll continuation state, if available."""
+        if self._agent is not None:
+            return self._scroll_summary_text(self._agent)
+        state = self._scroll_state
+        if not isinstance(state, dict):
+            return ""
+        raw_summary = state.get("continuation_summary")
+        if not isinstance(raw_summary, dict):
+            return ""
+        summary = ContinuationSummary.from_dict(raw_summary)
+        return summary.render() if summary is not None else ""
+
+    async def _uses_scroll_context(self) -> bool:
+        """Return whether the active light-context strategy is Scroll."""
+        try:
+            light_context = (
+                await self._get_agent_config_async()
+            ).running.light_context_config
+        except Exception:
+            return False
+        return getattr(light_context, "strategy", "native") == "scroll"
+
+    @staticmethod
     def _build_manual_context_config(agent_config: Any) -> Any:
-        """Build a ContextConfig that forces manual /compact to run."""
+        """Build the valid base ContextConfig for standalone compaction."""
         from agentscope.agent import ContextConfig
 
         ccc = agent_config.running.light_context_config.context_compact_config
+        trigger_ratio = ccc.compact_threshold_ratio
+        reserve_ratio = min(
+            ccc.reserve_threshold_ratio,
+            trigger_ratio - 0.000001,
+        )
         return ContextConfig(
-            trigger_ratio=0.000001,
-            reserve_ratio=ccc.reserve_threshold_ratio,
+            trigger_ratio=trigger_ratio,
+            reserve_ratio=reserve_ratio,
         )
 
-    async def _build_tmp_agent(self) -> "Agent | None":
+    async def _build_tmp_agent(
+        self,
+        agent_config: Any | None = None,
+    ) -> "Agent | None":
         """Build a minimal Agent for standalone compression.
 
         Shares ``self._state`` so compression side-effects (summary,
         context trimming, offloading) are reflected immediately.
         """
         try:
-            from agentscope.agent import Agent
+            from agentscope.agent import Agent, InjectionConfig
 
-            from ..agents.model_factory import (
-                create_model_and_formatter,
-            )
+            from ..agents.model_factory import create_model_and_formatter_async
 
-            agent_config = self._get_agent_config()
-            model, _fmt = create_model_and_formatter(
-                agent_config.id,
+            if agent_config is None:
+                agent_config = await self._get_agent_config_async()
+            model, _fmt = await create_model_and_formatter_async(
+                agent_id=agent_config.id,
+                agent_config=agent_config,
             )
 
             return Agent(
@@ -443,12 +575,15 @@ class CommandHandler(ConversationCommandHandlerMixin):
                 context_config=self._build_manual_context_config(
                     agent_config,
                 ),
+                injection_config=InjectionConfig(
+                    inject_runtime_state=False,
+                ),
             )
         except Exception:
             logger.exception("Failed to build temporary agent for /compact")
             return None
 
-    def _build_standalone_scroll_manager(self):
+    async def _build_standalone_scroll_manager(self, agent_config: Any):
         """Build a ScrollContextManager for a standalone ``/compact``.
 
         Returns ``None`` unless the strategy is ``scroll`` and a workspace is
@@ -457,10 +592,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
         ``close()`` it. No model is needed at construction (compaction reads it
         from the agent passed to ``compress``).
         """
-        try:
-            lcc = self._get_agent_config().running.light_context_config
-        except Exception:
-            return None
+        lcc = agent_config.running.light_context_config
         if (
             getattr(lcc, "strategy", "native") != "scroll"
             or not self._workspace_dir
@@ -471,7 +603,10 @@ class CommandHandler(ConversationCommandHandlerMixin):
             from .context.scroll.manager import ScrollContextManager
 
             sc = lcc.scroll_config
-            history = HistoryStore(Path(self._workspace_dir) / sc.db_filename)
+            history = await run_sync_io(
+                HistoryStore,
+                Path(self._workspace_dir) / sc.db_filename,
+            )
             # Must match the id normal turns persist under (the builder uses
             # ``ctx.session_id``), so these rows align with the live history.
             session_id = (
@@ -486,16 +621,6 @@ class CommandHandler(ConversationCommandHandlerMixin):
                 # Already gated: the adapter only supplies an offloader when
                 # ``offload_dialog`` is on, so this archives iff configured.
                 offloader=self._offloader,
-                summarize_unheadlined=getattr(
-                    sc,
-                    "summarize_unheadlined_evictions",
-                    True,
-                ),
-                summarize_timeout_s=getattr(
-                    sc,
-                    "summarize_eviction_timeout_seconds",
-                    20,
-                ),
             )
         except Exception:
             logger.exception("Failed to build scroll manager for /compact")
@@ -503,8 +628,10 @@ class CommandHandler(ConversationCommandHandlerMixin):
 
     async def _process_new(self, messages: list[Msg], _args: str = "") -> Msg:
         """Process /new command."""
+        await self._reset_modes()
         if not messages:
             self._set_summary("")
+            reset_auto_memory_turn_state(self._state)
             return await self._make_system_msg(
                 "**No messages to summarize.**\n\n"
                 "- Current memory is empty\n"
@@ -527,6 +654,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
         self._set_summary("")
 
         await self._persist_and_clear()
+        reset_auto_memory_turn_state(self._state)
         return await self._make_system_msg(
             "**New Conversation Started!**\n\n"
             "- Summary task started in background\n"
@@ -543,6 +671,8 @@ class CommandHandler(ConversationCommandHandlerMixin):
         """Process /clear command."""
         await self._persist_and_clear()
         self._set_summary("")
+        reset_auto_memory_turn_state(self._state)
+        await self._reset_modes()
         return await self._make_system_msg(
             "**History Cleared!**\n\n"
             "- Compressed summary reset\n"
@@ -571,6 +701,20 @@ class CommandHandler(ConversationCommandHandlerMixin):
         _args: str = "",
     ) -> Msg:
         """Process /compact_str command to show compressed summary."""
+        if await self._uses_scroll_context():
+            summary = self._stored_scroll_summary_text()
+            if not summary:
+                return await self._make_system_msg(
+                    "**No Continuation Summary**\n\n"
+                    "- Scroll has not generated a continuation summary yet\n"
+                    "- Use `/compact` or wait for auto-compaction\n"
+                    "- Archived turns remain recoverable through Scroll "
+                    "history",
+                )
+            return await self._make_system_msg(
+                f"**Continuation Summary**\n\n{summary}",
+            )
+
         summary = self._get_summary()
         if not summary:
             return await self._make_system_msg(
@@ -588,7 +732,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
         _args: str = "",
     ) -> Msg:
         """Process /history command."""
-        agent_config = self._get_agent_config()
+        agent_config = await self._get_agent_config_async()
         running_config = agent_config.running
         from .utils import get_token_counter
 
@@ -657,7 +801,12 @@ class CommandHandler(ConversationCommandHandlerMixin):
                 builder = AgentBuilder(
                     app_services=getattr(ctx, "app_services", None),
                 )
-                return builder.build_prompt(ctx, self._get_agent_config())
+                agent_config = await self._get_agent_config_async()
+                return await run_sync_io(
+                    builder.build_prompt,
+                    ctx,
+                    agent_config,
+                )
             except Exception as e:
                 logger.warning("rebuild system prompt failed: %s", e)
 
@@ -725,6 +874,54 @@ class CommandHandler(ConversationCommandHandlerMixin):
         return await self._make_system_msg(
             "**Auto-dream Complete**\n\n"
             "- Ran one auto-dream memory optimization pass",
+        )
+
+    async def _process_reme_status(
+        self,
+        _messages: list[Msg],
+        _args: str = "",
+    ) -> Msg:
+        """Process /reme_status to report embedded ReMe memory usage."""
+        if not self._has_memory_manager():
+            return await self._make_system_msg(
+                "**Memory Manager Disabled**\n\n"
+                "- Cannot inspect ReMe memory usage\n"
+                "- Set `memory_manager_backend` to `remelight` and restart "
+                "QwenPaw to enable this feature",
+            )
+
+        try:
+            response = await self.memory_manager.reme_status()
+        except Exception as e:
+            logger.exception("ReMe status failed: %s", e)
+            return await self._make_system_msg(
+                f"**ReMe Status Failed**\n\n- Error: {e}",
+            )
+
+        if response is None:
+            return await self._make_system_msg(
+                "**ReMe Status Unavailable**\n\n"
+                "- ReMe is not started or this memory backend does not "
+                "support status reporting",
+            )
+
+        answer = str(getattr(response, "answer", "") or "").strip()
+        if not getattr(response, "success", False):
+            return await self._make_system_msg(
+                "**ReMe Status Failed**\n\n"
+                f"- Error: {answer or 'Unknown ReMe error'}",
+            )
+
+        warning = (
+            "⚠️ **Estimation note:** ReMe estimates `EMBEDDING_STORE`, "
+            "`FILE_GRAPH`, `FILE_STORE`, and `KEYWORD_INDEX` independently. "
+            "Objects shared across those components may be counted more than "
+            "once, so the components total is not unique memory usage and "
+            "should not be compared directly with process RSS."
+        )
+        return await self._make_system_msg(
+            f"**ReMe Memory Status**\n\n```text\n{answer}\n```\n\n{warning}",
+            metadata=dict(getattr(response, "metadata", None) or {}),
         )
 
     async def _process_memorize(
@@ -875,7 +1072,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
         Returns:
             System message with the requested message content
         """
-        agent_config = self._get_agent_config()
+        agent_config = await self._get_agent_config_async()
         history_max_length = agent_config.running.history_max_length
 
         if not args:
@@ -943,7 +1140,7 @@ class CommandHandler(ConversationCommandHandlerMixin):
         Returns:
             System message with dump result
         """
-        agent_config = self._get_agent_config()
+        agent_config = await self._get_agent_config_async()
         history_file = Path(agent_config.workspace_dir) / DEBUG_HISTORY_FILE
 
         try:
@@ -964,11 +1161,11 @@ class CommandHandler(ConversationCommandHandlerMixin):
 
             dump_messages.extend(messages)
 
-            with open(history_file, "w", encoding="utf-8") as f:
-                for msg in dump_messages:
-                    f.write(
-                        json.dumps(msg.to_dict(), ensure_ascii=False) + "\n",
-                    )
+            await run_sync_io(
+                self._write_history_file,
+                history_file,
+                dump_messages,
+            )
 
             logger.info(
                 f"Dumped {len(dump_messages)} messages to {history_file}",
@@ -999,10 +1196,10 @@ class CommandHandler(ConversationCommandHandlerMixin):
         Returns:
             System message with load result
         """
-        agent_config = self._get_agent_config()
+        agent_config = await self._get_agent_config_async()
         history_file = Path(agent_config.workspace_dir) / DEBUG_HISTORY_FILE
 
-        if not history_file.exists():
+        if not await run_sync_io(history_file.exists):
             return await self._make_system_msg(
                 f"**Load Failed**\n\n"
                 f"- File not found: `{history_file}`\n"
@@ -1010,24 +1207,10 @@ class CommandHandler(ConversationCommandHandlerMixin):
             )
 
         try:
-            loaded_messages: list[Msg] = []
-            has_summary_marker = False
-            with open(history_file, encoding="utf-8") as f:
-                for i, line in enumerate(f):
-                    line = line.strip()
-                    if line:
-                        msg_dict = json.loads(line)
-                        msg = Msg.from_dict(msg_dict)
-                        loaded_messages.append(msg)
-                        # Check first message for summary marker
-                        if (
-                            i == 0
-                            and msg.metadata.get("has_compressed_summary")
-                            == "true"
-                        ):
-                            has_summary_marker = True
-                        if len(loaded_messages) >= MAX_LOAD_HISTORY_COUNT:
-                            break
+            loaded_messages, has_summary_marker = await run_sync_io(
+                self._read_history_file,
+                history_file,
+            )
 
             # Clear existing context without persisting (this IS the
             # "replay history into state" path; new context is what we
@@ -1045,6 +1228,12 @@ class CommandHandler(ConversationCommandHandlerMixin):
             for msg in loaded_messages:
                 self._state.context.append(msg)
 
+            # Auto-memory lifecycle data belongs to the context that was
+            # replaced above.  Do not let pending turns, saved snapshots, or
+            # search/seen caches from the previous history leak into the
+            # loaded conversation.
+            reset_auto_memory_turn_state(self._state)
+
             logger.info(
                 f"Loaded {len(loaded_messages)} messages from {history_file}",
             )
@@ -1060,6 +1249,39 @@ class CommandHandler(ConversationCommandHandlerMixin):
             return await self._make_system_msg(
                 f"**Load Failed**\n\n" f"- Error: {e}",
             )
+
+    @staticmethod
+    def _write_history_file(
+        history_file: Path,
+        messages: list[Msg],
+    ) -> None:
+        """Write a debug history snapshot in a worker thread."""
+        with open(history_file, "w", encoding="utf-8") as history_stream:
+            for msg in messages:
+                history_stream.write(
+                    f"{json.dumps(msg.to_dict(), ensure_ascii=False)}\n",
+                )
+
+    @staticmethod
+    def _read_history_file(history_file: Path) -> tuple[list[Msg], bool]:
+        """Read a bounded debug history snapshot in a worker thread."""
+        loaded_messages: list[Msg] = []
+        has_summary_marker = False
+        with open(history_file, encoding="utf-8") as history_stream:
+            for index, line in enumerate(history_stream):
+                line = line.strip()
+                if not line:
+                    continue
+                msg = Msg.from_dict(json.loads(line))
+                loaded_messages.append(msg)
+                if (
+                    index == 0
+                    and msg.metadata.get("has_compressed_summary") == "true"
+                ):
+                    has_summary_marker = True
+                if len(loaded_messages) >= MAX_LOAD_HISTORY_COUNT:
+                    break
+        return loaded_messages, has_summary_marker
 
     async def handle_conversation_command(self, query: str) -> Msg:
         """Process conversation system commands.
@@ -1081,7 +1303,11 @@ class CommandHandler(ConversationCommandHandlerMixin):
         parts = query.strip().lstrip("/").split(" ", maxsplit=1)
         command = parts[0]
         args = parts[1] if len(parts) > 1 else ""
-        logger.info(f"Processing command: {command}, args: {args}")
+        # Command arguments are user-controlled and may contain credentials
+        # (for example, a /compact hint containing an API key).  Do not log
+        # them: downstream handlers sanitize values for their own use, but
+        # logging happens before that handler-specific processing.
+        logger.info("Processing command: %s", command)
 
         handler = getattr(self, f"_process_{command}", None)
         if handler is None:
@@ -1121,7 +1347,10 @@ class CommandHandler(ConversationCommandHandlerMixin):
 
         # Get current agent ID and language
         active_agent_id = get_current_agent_id()
-        agent_config = load_agent_config(active_agent_id)
+        agent_config = await run_sync_io(
+            load_agent_config,
+            active_agent_id,
+        )
         agent_lang = getattr(agent_config, "language", "en")
 
         # Define warnings in both languages
@@ -1197,9 +1426,11 @@ class CommandHandler(ConversationCommandHandlerMixin):
 
         if not args or args == "on":
             try:
+                workspace = getattr(self._prompt_context, "workspace", None)
                 result = enable_proactive_for_session(
                     self.agent_name,
                     30,
+                    workspace=workspace,
                 )
                 return await self._make_system_msg(
                     msgs["enabled"].format(
@@ -1215,19 +1446,11 @@ class CommandHandler(ConversationCommandHandlerMixin):
 
         elif args == "off":
             try:
-                import asyncio
-                from .memory import proactive_tasks
+                from .memory import disable_proactive_for_session
 
-                if self.agent_name in proactive_tasks:
-                    task = proactive_tasks[self.agent_name]
-                    if not task.done():
-                        task.cancel()
-                        try:
-                            await task
-                        except asyncio.CancelledError:
-                            pass
-                    del proactive_tasks[self.agent_name]
-
+                result = await disable_proactive_for_session(
+                    self.agent_name,
+                )
                 return await self._make_system_msg(
                     msgs["disabled"],
                 )
@@ -1241,9 +1464,11 @@ class CommandHandler(ConversationCommandHandlerMixin):
                 if minutes <= 0:
                     raise ValueError("Minutes must be a positive integer")
 
+                workspace = getattr(self._prompt_context, "workspace", None)
                 result = enable_proactive_for_session(
                     self.agent_name,
                     minutes,
+                    workspace=workspace,
                 )
                 return await self._make_system_msg(
                     msgs["enabled"].format(

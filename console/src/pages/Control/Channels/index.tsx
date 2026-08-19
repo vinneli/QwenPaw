@@ -16,13 +16,14 @@ import {
 } from "./components";
 import { PageHeader } from "@/components/PageHeader";
 import { useAppMessage } from "../../../hooks/useAppMessage";
+import { keepConsoleEnabled } from "./components/channelConfig";
 import styles from "./index.module.less";
 
 type FilterType = "all" | "builtin" | "custom";
 
 function ChannelsPage() {
   const { t } = useTranslation();
-  const { message } = useAppMessage();
+  const { message, modal } = useAppMessage();
   const {
     channels,
     orderedKeys,
@@ -82,7 +83,10 @@ function ChannelsPage() {
     (key: ChannelKey) => {
       setActiveKey(key);
       setDrawerOpen(true);
-      const channelConfig = channels[key] || { enabled: false, bot_prefix: "" };
+      const channelConfig = keepConsoleEnabled(
+        key,
+        channels[key] || { enabled: false, bot_prefix: "" },
+      );
       // Migrate legacy allowlist policy to new access control fields
       const accessControlDm =
         channelConfig.access_control_dm ||
@@ -94,8 +98,11 @@ function ChannelsPage() {
         ...channelConfig,
         access_control_dm: accessControlDm,
         access_control_group: accessControlGroup,
-        filter_tool_messages: !channelConfig.filter_tool_messages,
-        filter_thinking: !channelConfig.filter_thinking,
+        show_tool_calls: channelConfig.show_tool_calls ?? true,
+        show_tool_results: channelConfig.show_tool_results ?? true,
+        tool_call_max_length: channelConfig.tool_call_max_length ?? 200,
+        tool_result_max_length: channelConfig.tool_result_max_length ?? 500,
+        show_thinking: channelConfig.show_thinking ?? true,
       });
     },
     [channels, form],
@@ -111,27 +118,66 @@ function ChannelsPage() {
 
     // eslint-disable-next-line @typescript-eslint/no-unused-vars
     const { isBuiltin: _isBuiltin, ...savedConfig } = channels[activeKey] || {};
-    const updatedChannel: Record<string, unknown> = {
+    const updatedChannel = keepConsoleEnabled(activeKey, {
       ...savedConfig,
       ...values,
-      filter_tool_messages: !values.filter_tool_messages,
-      filter_thinking: !values.filter_thinking,
-    };
+    });
+    const proposedConfig = updatedChannel as unknown as Parameters<
+      typeof api.updateChannelConfig
+    >[1];
 
     setSaving(true);
     try {
-      await api.updateChannelConfig(
-        activeKey,
-        updatedChannel as unknown as Parameters<
-          typeof api.updateChannelConfig
-        >[1],
-      );
+      if (updatedChannel.enabled === true) {
+        try {
+          const result = await api.checkChannelConflict(
+            activeKey,
+            proposedConfig,
+          );
+          if (result.conflict) {
+            const agentNames = result.agents
+              .map(({ agent_id, agent_name }) =>
+                agent_name === agent_id
+                  ? agent_id
+                  : `${agent_name} (${agent_id})`,
+              )
+              .join(", ");
+            const shouldSave = await new Promise<boolean>((resolve) => {
+              let settled = false;
+              const settle = (value: boolean) => {
+                if (settled) return;
+                settled = true;
+                resolve(value);
+              };
+
+              modal.confirm({
+                centered: true,
+                title: t("channels.botConflictTitle"),
+                content: t("channels.botConflictDescription", {
+                  agents: agentNames,
+                }),
+                okText: t("channels.botConflictConfirm"),
+                okButtonProps: { danger: true },
+                cancelText: t("common.cancel"),
+                onOk: () => settle(true),
+                onCancel: () => settle(false),
+                afterClose: () => settle(false),
+              });
+            });
+            if (!shouldSave) return;
+          }
+        } catch (error) {
+          console.warn("Failed to check channel Bot conflicts:", error);
+        }
+      }
+
+      await api.updateChannelConfig(activeKey, proposedConfig);
       await fetchChannels();
 
       setDrawerOpen(false);
       message.success(t("channels.configSaved"));
     } catch (error) {
-      console.error("❌ Failed to update channel config:", error);
+      console.error("Failed to update channel config:", error);
       message.error(t("channels.configFailed"));
     } finally {
       setSaving(false);

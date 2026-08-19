@@ -194,16 +194,34 @@ def _prepare_off_mode_sandbox(tool: Any, governor: Any) -> None:
     unsandboxed by design, and forcing a sandbox on them would silently narrow
     their filesystem access.
 
-    A no-op (leaving ``sandbox_config=None``) when the platform has no sandbox:
-    such a REPL is never registered in the first place, or it tolerates
-    unsandboxed execution via ``allow_unsandboxed``.
+    A no-op (leaving ``sandbox_config=None``) when the sandbox is not usable
+    -- either the platform has no sandbox, or the operator turned the global
+    ``security.sandbox_enabled`` switch off. In both cases such a REPL is
+    never registered in the first place, or it tolerates unsandboxed
+    execution via ``allow_unsandboxed``.
+
+    Uses ``governor.sandbox_usable`` (platform support AND the global switch)
+    rather than the platform-only ``sandbox_available`` probe, so that an
+    explicit ``sandbox_enabled=false`` is honoured on the OFF-mode path just
+    like it is on the normal policy path (see
+    :meth:`ResourceGovernor._sandbox_usable`).
     """
-    if governor is None or not getattr(governor, "sandbox_available", False):
+    # These attributes live on a reusable FunctionTool wrapper, but describe
+    # one invocation only.  Clear any previous decision before consulting the
+    # current switch so a hot toggle (or a failed recompile) cannot reuse a
+    # stale sandbox config from an earlier call.
+    for attr in ("_qp_sandbox_mode", "_qp_sandbox_config"):
+        if hasattr(tool, attr):
+            delattr(tool, attr)
+
+    if governor is None:
         return
     policy_name = DEFAULT_REGISTRY.python_to_policy_name(
         getattr(tool, "name", "Unknown"),
     )
     if not DEFAULT_REGISTRY.requires_sandbox(policy_name):
+        return
+    if not getattr(governor, "sandbox_usable", False):
         return
     try:
         tc_spec = tool._build_tc_spec()
@@ -218,7 +236,7 @@ def _prepare_off_mode_sandbox(tool: Any, governor: Any) -> None:
         )
 
 
-# pylint: disable=too-many-return-statements
+# pylint: disable=too-many-return-statements,too-many-branches
 async def _policy_tool_check_permissions(
     self: Any,
     input_data: dict[str, Any] | None = None,
@@ -244,6 +262,24 @@ async def _policy_tool_check_permissions(
     # ── Effective approval_level check (session > agent) ──
     request_ctx = getattr(self, "_qp_request_context", None) or {}
     effective_level = _resolve_effective_approval_level(request_ctx)
+
+    # ── Mail F1 exploration mode: force STRICT for every tool ──
+    # F1 is a session-level flag registered by the
+    # activate_f1_exploration_mode tool (a module-level registry is used
+    # because per-tool asyncio tasks isolate ContextVar writes). While
+    # active it overrides the session/agent approval_level (including
+    # OFF): all tool calls require user approval.
+    from ..config.context import (
+        get_current_session_id,
+        is_f1_active_for_session,
+    )
+    from ..security.tool_guard.execution_level import ToolExecutionLevel
+
+    _f1_session_id = request_ctx.get("session_id") or get_current_session_id()
+    f1_active = is_f1_active_for_session(_f1_session_id)
+    if f1_active:
+        effective_level = ToolExecutionLevel.STRICT
+
     if effective_level is not None and effective_level.is_disabled():
         # OFF means "never ask the user" — it does NOT mean "skip the
         # sandbox". Sandbox isolation is an execution mechanism, not an
@@ -260,7 +296,9 @@ async def _policy_tool_check_permissions(
 
     # Sync effective approval_level to the governor's policy
     # so the three-phase evaluation uses the correct threshold.
-    if governor is not None and effective_level is not None:
+    # Skipped while F1 is active: F1's STRICT is applied per-evaluation
+    # below (set + restore) so it cannot leak into later requests.
+    if governor is not None and effective_level is not None and not f1_active:
         governor.policy.execution_level = effective_level.value
 
     if governor is None:
@@ -289,7 +327,18 @@ async def _policy_tool_check_permissions(
 
     tc_spec = self._build_tc_spec()
 
-    decision = governor.assert_policy(tc_spec)
+    if f1_active:
+        # Temporarily force STRICT for this evaluation only, then restore
+        # the previous level (assert_policy is synchronous, so this
+        # set/restore is atomic within the event loop).
+        prev_level = governor.policy.execution_level
+        governor.policy.execution_level = ToolExecutionLevel.STRICT.value
+        try:
+            decision = governor.assert_policy(tc_spec)
+        finally:
+            governor.policy.execution_level = prev_level
+    else:
+        decision = governor.assert_policy(tc_spec)
     governor.audit(tc_spec, decision)
 
     # Cache the decision + tc_spec for __call__ to use
@@ -626,6 +675,8 @@ async def _ask_user_approval(
     if session_id and tool_call_id:
         await svc.cancel_stale_pending_for_tool_call(session_id, tool_call_id)
 
+    from ..config.context import get_f1_reasoning
+
     pending = await svc.create_pending(
         session_id=session_id,
         root_session_id=root_session_id,
@@ -651,6 +702,10 @@ async def _ask_user_approval(
             },
             "channel_meta": ctx.get("channel_meta"),
             "_channel_instance": ctx.get("_channel_instance"),
+            "reasoning": get_f1_reasoning(session_id),
+            **(
+                {"_spawn_subagent": True} if ctx.get("_spawn_subagent") else {}
+            ),
         },
     )
 
