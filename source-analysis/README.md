@@ -16,7 +16,7 @@
 | [08-扩展机制](./08-extensibility.md) | Hooks、Plugins、Modes、`@api_action` |
 | [09-数据流](./09-data-flow.md) | 端到端请求路径（Console / IM / Cron / ACP） |
 | [10-设计模式与要点](./10-design-patterns.md) | 设计亮点、复杂度风险、阅读建议 |
-| [11-Config 模块](./11-config-module.md) | 两层 JSON、Pydantic 模型树、mtime 缓存、迁移与 ContextVar |
+| [11-Config 模块](./11-config-module.md) | 进程 / Agent / 请求三层，以及 load 时的校验、升级与缓存 |
 
 ## 快速定位
 
